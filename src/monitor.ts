@@ -7,15 +7,21 @@
 // It is configured entirely from the environment so the same image can be pointed at any
 // deployment:
 //   MONITOR_URL                  target wss:// /transcribe URL. If it contains the literal token
-//                                __SESSION_ID__ it is replaced per run with a fresh
-//                                monitor-<random> id so consecutive checks never clash.
+//                                __SESSION_ID__ it is replaced per check with a fresh
+//                                monitor-<random> id.
 //   MONITOR_INTERVAL_SECONDS     how often to run a check (default 300)
 //   MONITOR_HEADERS              extra request headers as a JSON object {"Name":"Value",...}
 //                                (e.g. access-control headers); optional
+//   MONITOR_CONNECT_TIMEOUT      seconds to wait for the websocket to open (default 30). Behind
+//                                Cloudflare Containers the worker only completes the WS upgrade
+//                                once the container is up, so a cold start (~30s) counts against
+//                                this — it must be large enough to cover one.
 //   MONITOR_RETRY_DELAY_SECONDS  wait before the single retry after a failed attempt (default 20);
-//                                a check is unhealthy only if both attempts fail
+//                                a check is unhealthy only if both attempts fail. Both attempts of
+//                                a check reuse the SAME sessionId, so the retry lands on the
+//                                container the first attempt warmed rather than cold-starting a
+//                                second one.
 //   MONITOR_SAMPLE               path to the JSONL Opus dump to replay (default resources/sample.jsonl)
-//   MONITOR_CONNECT_TIMEOUT      seconds to wait for the websocket to connect (default 15)
 //   MONITOR_MIN_FINALS           minimum final transcripts required to pass (default 1)
 //   MONITOR_PORT / PORT          port for the metrics HTTP server (default 8080)
 
@@ -26,11 +32,12 @@ import crypto from 'node:crypto';
 const PORT = parseInt(process.env.MONITOR_PORT || process.env.PORT || '8080', 10);
 const INTERVAL_MS = parseInt(process.env.MONITOR_INTERVAL_SECONDS || '300', 10) * 1000;
 const RETRY_DELAY_MS = parseInt(process.env.MONITOR_RETRY_DELAY_SECONDS || '20', 10) * 1000;
-const CONNECT_TIMEOUT = process.env.MONITOR_CONNECT_TIMEOUT || '15';
+const CONNECT_TIMEOUT = process.env.MONITOR_CONNECT_TIMEOUT || '30';
 const MIN_FINALS = process.env.MONITOR_MIN_FINALS || '1';
 const SAMPLE = process.env.MONITOR_SAMPLE || 'resources/sample.jsonl';
 const URL_TEMPLATE = process.env.MONITOR_URL;
 const REPLAY_SCRIPT = 'scripts/replay-dump.cjs';
+const ATTEMPTS = 2;
 
 if (!URL_TEMPLATE) {
 	console.error('monitor: MONITOR_URL is required');
@@ -59,6 +66,9 @@ function parseHeaders(raw: string | undefined): Record<string, string> {
 
 const HEADERS = parseHeaders(process.env.MONITOR_HEADERS);
 
+// Timestamped logging so the monitor's allocation logs read as a clear, ordered timeline.
+const log = (msg: string): void => console.log(`${new Date().toISOString()} ${msg}`);
+
 // State exposed via /metrics.
 let healthy = 0; // 1 if the last completed check passed, 0 otherwise (0 until the first check)
 let lastCheckTs = 0; // unix seconds of the last completed check
@@ -67,41 +77,78 @@ let checksTotal = 0;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-// Run one replay attempt against a fresh session. Resolves true on success (replay exit 0).
-function runReplayOnce(): Promise<boolean> {
+interface AttemptResult {
+	ok: boolean;
+}
+
+// Run one replay attempt for the given session. Captures the replay's output and logs a single
+// concise, timestamped summary line (connected? / result / transcript count) rather than the raw
+// progress-bar stream, so the monitor logs stay readable.
+function runAttempt(sessionId: string, attemptNo: number): Promise<AttemptResult> {
 	return new Promise((resolve) => {
-		const sessionId = 'monitor-' + crypto.randomBytes(6).toString('hex');
 		const url = (URL_TEMPLATE as string).replace('__SESSION_ID__', sessionId);
 		const args = [REPLAY_SCRIPT, SAMPLE, url, '0', '--ci', `--connect-timeout=${CONNECT_TIMEOUT}`, `--assert-min-finals=${MIN_FINALS}`];
-		// Pass headers to the replay via the environment (REPLAY_HEADERS), never on the command
-		// line, so credential-bearing values stay out of the process argument list.
+		// Headers go to the replay via REPLAY_HEADERS (env), never on the command line, so
+		// credential-bearing values stay out of the process argument list.
 		const childEnv = { ...process.env };
-		if (Object.keys(HEADERS).length > 0) {
-			childEnv.REPLAY_HEADERS = JSON.stringify(HEADERS);
-		}
-		console.log(`monitor: starting check sessionId=${sessionId}`);
-		const child = spawn('node', args, { stdio: ['ignore', 'inherit', 'inherit'], env: childEnv });
-		child.on('exit', (code) => resolve(code === 0));
+		if (Object.keys(HEADERS).length > 0) childEnv.REPLAY_HEADERS = JSON.stringify(HEADERS);
+
+		log(`monitor: attempt ${attemptNo}/${ATTEMPTS} starting (sessionId=${sessionId})`);
+		const startedAt = Date.now();
+		const child = spawn('node', args, { stdio: ['ignore', 'pipe', 'pipe'], env: childEnv });
+
+		let buf = '';
+		const collect = (d: Buffer) => {
+			buf += d.toString();
+		};
+		if (child.stdout) child.stdout.on('data', collect);
+		if (child.stderr) child.stderr.on('data', collect);
+
 		child.on('error', (err) => {
-			console.error(`monitor: failed to spawn replay: ${err.message}`);
-			resolve(false);
+			log(`monitor: attempt ${attemptNo}/${ATTEMPTS} could not start replay: ${err.message}`);
+			resolve({ ok: false });
+		});
+		child.on('exit', (code) => {
+			const secs = ((Date.now() - startedAt) / 1000).toFixed(1);
+			const ok = code === 0;
+			const connected = /Connected!/.test(buf);
+			const resultLine = (buf.match(/INTEGRATION_RESULT:[^\n]*/g) || []).pop();
+			const finalsMatch = buf.match(/(\d+)\s+final transcript/);
+			const finals = finalsMatch ? parseInt(finalsMatch[1], 10) : 0;
+			const transcriptMatch = buf.match(/^\[[^\]]+\]\s+\([^)]*\)\s+(.+)$/m);
+			const transcript = transcriptMatch ? transcriptMatch[1].trim().slice(0, 80) : '';
+			if (ok) {
+				log(`monitor: attempt ${attemptNo}/${ATTEMPTS} PASS in ${secs}s (finals=${finals}${transcript ? `, "${transcript}"` : ''})`);
+			} else {
+				const reason = resultLine
+					? resultLine.replace('INTEGRATION_RESULT: ', '').replace('FAIL: ', '')
+					: `replay exited ${code} with no result line`;
+				log(`monitor: attempt ${attemptNo}/${ATTEMPTS} FAIL in ${secs}s (connected=${connected}; ${reason})`);
+			}
+			resolve({ ok });
 		});
 	});
 }
 
-// One check = an attempt plus one retry on failure. Updates the exposed state.
+// One check = an attempt plus one retry on failure, both against the same session id.
 async function runCheck(): Promise<void> {
-	let ok = await runReplayOnce();
-	if (!ok) {
-		console.log(`monitor: first attempt failed, retrying in ${RETRY_DELAY_MS / 1000}s`);
+	const sessionId = 'monitor-' + crypto.randomBytes(6).toString('hex');
+	const startedAt = Date.now();
+	log(`monitor: check starting (sessionId=${sessionId})`);
+
+	let result = await runAttempt(sessionId, 1);
+	if (!result.ok) {
+		log(`monitor: retrying same session in ${RETRY_DELAY_MS / 1000}s`);
 		await sleep(RETRY_DELAY_MS);
-		ok = await runReplayOnce();
+		result = await runAttempt(sessionId, 2);
 	}
-	healthy = ok ? 1 : 0;
+
+	healthy = result.ok ? 1 : 0;
 	lastCheckTs = Math.floor(Date.now() / 1000);
-	if (ok) lastHealthyTs = lastCheckTs;
+	if (result.ok) lastHealthyTs = lastCheckTs;
 	checksTotal += 1;
-	console.log(`monitor: check complete healthy=${healthy}`);
+	const secs = ((Date.now() - startedAt) / 1000).toFixed(1);
+	log(`monitor: check complete: ${result.ok ? 'HEALTHY' : 'UNHEALTHY'} (healthy=${healthy}) in ${secs}s`);
 }
 
 async function loop(): Promise<void> {
@@ -109,7 +156,7 @@ async function loop(): Promise<void> {
 		try {
 			await runCheck();
 		} catch (err) {
-			console.error(`monitor: check error: ${err instanceof Error ? err.message : String(err)}`);
+			log(`monitor: check error: ${err instanceof Error ? err.message : String(err)}`);
 			healthy = 0;
 			lastCheckTs = Math.floor(Date.now() / 1000);
 		}
@@ -153,13 +200,13 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
-	console.log(`monitor: metrics server listening on :${PORT}, interval=${INTERVAL_MS / 1000}s`);
+	log(`monitor: metrics server listening on :${PORT}, interval=${INTERVAL_MS / 1000}s, connect-timeout=${CONNECT_TIMEOUT}s`);
 	void loop();
 });
 
 for (const sig of ['SIGTERM', 'SIGINT'] as const) {
 	process.on(sig, () => {
-		console.log(`monitor: received ${sig}, shutting down`);
+		log(`monitor: received ${sig}, shutting down`);
 		server.close(() => process.exit(0));
 		setTimeout(() => process.exit(0), 3000).unref();
 	});
