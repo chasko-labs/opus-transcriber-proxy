@@ -45,7 +45,7 @@ function makeFakeWebSocket(): FakeWs {
 }
 
 /** Runtime whose encoder emits exactly one 3-byte Opus frame per encodeFrame call. */
-function makeHarness(): { runtime: TranslationRuntime; sockets: FakeWs[] } {
+function makeHarness(talkSilenceTimeoutMs = TALK_TIMEOUT_MS): { runtime: TranslationRuntime; sockets: FakeWs[] } {
 	const sockets: FakeWs[] = [];
 	const runtime: TranslationRuntime = {
 		logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -56,7 +56,7 @@ function makeHarness(): { runtime: TranslationRuntime; sockets: FakeWs[] } {
 			debug: false,
 			translationUsageUrl: 'https://usage.test/report',
 			usageReportIntervalMs: 0,
-			talkSilenceTimeoutMs: TALK_TIMEOUT_MS,
+			talkSilenceTimeoutMs,
 		},
 		writeMetric: () => {},
 		createMetricBatcher: () => ({ increment: () => {}, flush: () => {} }),
@@ -97,13 +97,13 @@ describe('TranslatorConnection talk boundaries', () => {
 		vi.restoreAllMocks();
 	});
 
-	async function connect(): Promise<{
+	async function connect(talkSilenceTimeoutMs = TALK_TIMEOUT_MS): Promise<{
 		conn: TranslatorConnection;
 		ws: FakeWs;
 		starts: Array<[string, number]>;
 		stops: Array<[string, number, { bytesSent: number; duration: number }]>;
 	}> {
-		const { runtime, sockets } = makeHarness();
+		const { runtime, sockets } = makeHarness(talkSilenceTimeoutMs);
 		const conn = new TranslatorConnection('55555555-a0', { targetLanguage: 'hi' }, runtime);
 		const starts: Array<[string, number]> = [];
 		const stops: Array<[string, number, { bytesSent: number; duration: number }]> = [];
@@ -230,6 +230,20 @@ describe('TranslatorConnection talk boundaries', () => {
 		await advancePastSilence(); // silence with no prior audio -> no talk was ever started
 		expect(starts).toEqual([]);
 		expect(stops).toEqual([]);
+	});
+
+	it('with the timeout disabled (<= 0) never ends a talk on silence, only at close', async () => {
+		const { conn, ws, starts, stops } = await connect(0);
+
+		ws.fireMessage(audioDelta());
+		expect(starts).toHaveLength(1);
+		// No silence timer is armed, so even a long silence produces no stop.
+		await vi.advanceTimersByTimeAsync(60_000);
+		expect(stops).toEqual([]);
+
+		// The talk only ends when the connection tears down.
+		conn.close();
+		expect(stops).toHaveLength(1);
 	});
 
 	it('closes an in-progress talk when the connection closes', async () => {

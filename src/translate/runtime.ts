@@ -77,6 +77,10 @@ export interface TranslationRuntimeConfig {
 	 * after the last frame arrives): the talk ends this long after the buffered audio would finish playing, and
 	 * the next delta starts a new talk. Default 350. Must exceed the RtpTimestamper gap threshold (100ms) so a
 	 * new talk begins after a real silence gap. Resolved by each runtime from its environment.
+	 *
+	 * WARNING: <= 0 disables silence-based inference. Since /v1/realtime/translations emits no per-utterance
+	 * boundary event, disabling it means a talk never ends until the connection closes (no per-utterance
+	 * sending-change). Only disable when pointed at an endpoint that sends explicit done events.
 	 */
 	talkSilenceTimeoutMs?: number;
 }

@@ -759,6 +759,7 @@ export class TranslatorConnection {
 			this.talkActive = true;
 			this.talkStartTimestamp = timestamp;
 			this.talkBytes = 0;
+			this.log(`[${this.options.targetLanguage}] talk start tag=${this.localTag} ts=${timestamp}`);
 			this.onTalkStart?.(this.localTag, timestamp);
 		}
 		this.lastFrameTimestamp = timestamp;
@@ -812,6 +813,10 @@ export class TranslatorConnection {
 		// equals the [start, stop) interval the talk-start/stop timestamps bracket, so it includes any silence the
 		// RtpTimestamper inserted mid-run. bytesSent is the total encoded Opus payload.
 		const duration = Math.round((stopTimestamp - this.talkStartTimestamp) / (RTP_CLOCK_RATE / 1000));
+		this.log(
+			`[${this.options.targetLanguage}] talk stop tag=${this.localTag} ts=${stopTimestamp} ` +
+				`bytes=${this.talkBytes} durationMs=${duration}`,
+		);
 		this.onTalkStop?.(this.localTag, stopTimestamp, { bytesSent: this.talkBytes, duration });
 	}
 
