@@ -152,11 +152,13 @@ export class TranslatorConnection {
 	onClosed?: (tag: string) => void = undefined;
 	onTranscription?: (transcript: string, targetLanguage: string, isInterim: boolean) => void = undefined;
 	onAudioFrame?: (tag: string, chunk: number, timestamp: number, payload: string) => void = undefined;
-	// Talk boundaries: a "talk" is one contiguous run of translated audio (one OpenAI response window). onTalkStart
-	// fires on the first frame of the run (timestamp = that frame's RTP timestamp); onTalkStop fires at end-of-
-	// utterance with a timestamp one past the end of the run (the last frame's RTP timestamp + one frame), i.e. the
-	// timestamp the next contiguous packet would carry — so the run spans [start, stop). onTalkStop also reports the
-	// run's mediaInfo: bytesSent (total encoded Opus payload bytes) and duration (ms, the [start, stop) span).
+	// Talk boundaries: a "talk" is one contiguous run of translated audio. onTalkStart fires on the first frame of
+	// the run (timestamp = that frame's RTP timestamp); onTalkStop fires when the output goes silent (see
+	// armTalkSilenceTimer) with a timestamp one past the end of the run (the last frame's RTP timestamp + one frame),
+	// i.e. the timestamp the next contiguous packet would carry — so the run spans [start, stop). onTalkStop also
+	// reports the run's mediaInfo: bytesSent (total encoded Opus payload bytes) and duration (ms, the [start, stop)
+	// span). The /v1/realtime/translations endpoint has no per-utterance boundary event, so end-of-talk is inferred
+	// from an output-audio silence gap rather than an OpenAI "done" event.
 	onTalkStart?: (tag: string, timestamp: number) => void = undefined;
 	onTalkStop?: (tag: string, timestamp: number, mediaInfo: { bytesSent: number; duration: number }) => void = undefined;
 
@@ -167,6 +169,10 @@ export class TranslatorConnection {
 	private lastFrameTimestamp = 0;
 	private talkStartTimestamp = 0;
 	private talkBytes = 0;
+	// Debounce timer that ends the talk after talkSilenceTimeoutMs of no output audio (re-armed on each frame).
+	private talkTimeout?: ReturnType<typeof setTimeout>;
+	// End-of-talk silence timeout in ms; 0 disables inference (only a done event / close ends a talk). Set in the ctor.
+	private readonly talkSilenceTimeoutMs: number;
 
 	// Per-response latency measurement.
 	// firstInputToFirstOutput (TTFA — "time to first audio") = wall-clock from
@@ -201,6 +207,7 @@ export class TranslatorConnection {
 		this.options = options;
 		this.runtime = runtime;
 		this.measureLatency = runtime.config.debug;
+		this.talkSilenceTimeoutMs = runtime.config.talkSilenceTimeoutMs ?? 350;
 		this.metricBatcher = runtime.createMetricBatcher();
 
 		// Report usage incrementally (periodic deltas) while the direction is open, but only when a
@@ -705,6 +712,12 @@ export class TranslatorConnection {
 		// window so the next response is measured from its own input. The RTP timeline is NOT reset here —
 		// RtpTimestamper keeps one continuous, monotonic timeline across responses and inserts the real
 		// silence gap on the next frame. These events do not carry the transcript (emitted above).
+		//
+		// NOTE: the /v1/realtime/translations endpoint this class connects to does NOT emit these events — it
+		// streams output-audio deltas with no per-utterance boundary. Talk-stop there is driven by the silence
+		// timer (armTalkSilenceTimer), not this branch. This branch only fires against the general /v1/realtime
+		// endpoint; endTalk() is kept here as a defensive early-stop for that case (the timer would otherwise stop
+		// the talk shortly after anyway).
 		if (
 			parsedMessage.type === 'session.output_audio.done'
 			|| parsedMessage.type === 'response.output_audio.done'
@@ -713,8 +726,6 @@ export class TranslatorConnection {
 			this.firstOutputAt = null;
 			this.firstInputAt = null;
 			this.lastInputAppendAt = null;
-			// Close the talk opened by this response window's first audio frame. No-op if the window produced no
-			// audio (e.g. response.done with no deltas), since no talk was started.
 			this.endTalk();
 			this.log(`[${this.options.targetLanguage}] ${parsedMessage.type}`);
 			return;
@@ -739,7 +750,7 @@ export class TranslatorConnection {
 		// The RtpTimestamper produces a monotonic RTP timestamp (inserting a real-silence gap when the
 		// source idled longer than the buffered media) and a uint16 RTP sequence number. JVB's
 		// Conference.handleMediaMessage reinterprets `media.chunk` as that 16-bit RTP sequence number.
-		const { timestamp, sequenceNumber: rtpSequenceNumber } = this.rtpTimestamper.nextFrameTimestamp();
+		const { timestamp, sequenceNumber: rtpSequenceNumber, bufferAheadMs } = this.rtpTimestamper.nextFrameTimestamp();
 
 		// First frame of a talk: emit the talk-start boundary at this frame's timestamp, and reset the run's
 		// mediaInfo accumulators. The end-of-utterance handler emits the matching talk-stop. Uses its own flag
@@ -748,10 +759,16 @@ export class TranslatorConnection {
 			this.talkActive = true;
 			this.talkStartTimestamp = timestamp;
 			this.talkBytes = 0;
+			this.log(`[${this.options.targetLanguage}] talk start tag=${this.localTag} ts=${timestamp}`);
 			this.onTalkStart?.(this.localTag, timestamp);
 		}
 		this.lastFrameTimestamp = timestamp;
 		this.talkBytes += opusFrame.length;
+		// (Re)arm the silence timer against the MEDIA playout, not frame arrival: OpenAI streams faster than real
+		// time (a 2 s utterance can arrive in ~200 ms), so the consumer is still playing out the buffered burst long
+		// after the last frame arrives. Wait until that buffered media would finish playing (bufferAheadMs) plus the
+		// silence margin before ending the talk.
+		this.armTalkSilenceTimer(bufferAheadMs);
 
 		const payload = bytesToBase64(opusFrame);
 
@@ -759,8 +776,32 @@ export class TranslatorConnection {
 		this.onAudioFrame?.(this.localTag, rtpSequenceNumber, timestamp, payload);
 	}
 
+	/**
+	 * (Re)arm the end-of-talk silence timer. The /v1/realtime/translations endpoint streams output-audio deltas with
+	 * no per-utterance boundary event, so a talk is ended when the output goes silent; the next frame starts a fresh
+	 * talk. Called on every emitted frame (debounce). The delay is measured from the projected MEDIA playout end
+	 * (`bufferAheadMs`, how long the already-emitted burst will still be playing) plus `talkSilenceTimeoutMs` of
+	 * silence beyond it — so a faster-than-real-time burst doesn't end the talk while the consumer is still playing
+	 * it out. A non-positive timeout disables inference (a talk then ends only on a done event, if any, or at close).
+	 */
+	private armTalkSilenceTimer(bufferAheadMs: number): void {
+		if (this.talkTimeout !== undefined) {
+			clearTimeout(this.talkTimeout);
+			this.talkTimeout = undefined;
+		}
+		if (this.talkSilenceTimeoutMs > 0) {
+			this.talkTimeout = setTimeout(() => this.endTalk(), bufferAheadMs + this.talkSilenceTimeoutMs);
+			// Don't keep the process alive solely for this timer (Node's Timeout has unref; the Worker's id doesn't).
+			(this.talkTimeout as unknown as { unref?: () => void }).unref?.();
+		}
+	}
+
 	/** Emit the talk-stop boundary if a talk is in progress. Idempotent (a no-op when no talk is active). */
 	private endTalk(): void {
+		if (this.talkTimeout !== undefined) {
+			clearTimeout(this.talkTimeout);
+			this.talkTimeout = undefined;
+		}
 		if (!this.talkActive) {
 			return;
 		}
@@ -772,6 +813,10 @@ export class TranslatorConnection {
 		// equals the [start, stop) interval the talk-start/stop timestamps bracket, so it includes any silence the
 		// RtpTimestamper inserted mid-run. bytesSent is the total encoded Opus payload.
 		const duration = Math.round((stopTimestamp - this.talkStartTimestamp) / (RTP_CLOCK_RATE / 1000));
+		this.log(
+			`[${this.options.targetLanguage}] talk stop tag=${this.localTag} ts=${stopTimestamp} ` +
+				`bytes=${this.talkBytes} durationMs=${duration}`,
+		);
 		this.onTalkStop?.(this.localTag, stopTimestamp, { bytesSent: this.talkBytes, duration });
 	}
 

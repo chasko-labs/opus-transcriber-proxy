@@ -12,9 +12,20 @@ import { registerWorkerOpusWasm } from './opusWasmSource';
 import { WorkerOutboundWebSocket } from './outboundWebSocket';
 import { parseIntOr } from '../src/translate/env';
 
+// Warn at most once per isolate if talk-end detection is disabled (see below).
+let warnedTalkTimeoutDisabled = false;
+
 export function createWorkerTranslationRuntime(env: Env, request?: Request): TranslationRuntime {
 	registerWorkerOpusWasm();
 	const debugEnabled = env.DEBUG === 'true';
+	const talkSilenceTimeoutMs = parseIntOr(env.TRANSLATION_TALK_SILENCE_TIMEOUT_MS, 350);
+	if (talkSilenceTimeoutMs <= 0 && !warnedTalkTimeoutDisabled) {
+		warnedTalkTimeoutDisabled = true;
+		console.warn(
+			'TRANSLATION_TALK_SILENCE_TIMEOUT_MS <= 0 disables talk-end detection; on the /v1/realtime/translations ' +
+				'endpoint (no boundary event) translated sources will never report sending=false until the connection closes.',
+		);
+	}
 	return {
 		logger: {
 			// Gate debug on the flag (mirrors the Node LOG_LEVEL behaviour). Unconditional console.debug
@@ -33,6 +44,7 @@ export function createWorkerTranslationRuntime(env: Env, request?: Request): Tra
 			debug: debugEnabled,
 			translationUsageUrl: env.TRANSLATION_USAGE_URL || '',
 			usageReportIntervalMs: parseIntOr(env.TRANSLATION_USAGE_REPORT_INTERVAL_MS, 15000),
+			talkSilenceTimeoutMs,
 		},
 		writeMetric() {
 			// No OTLP in the Worker (yet); metrics are a no-op.

@@ -1,8 +1,10 @@
 /**
- * Talk-boundary tests for TranslatorConnection: a "talk" (one OpenAI response window that produced audio) is
- * bracketed by onTalkStart (first emitted frame) and onTalkStop (end-of-utterance). The harness supplies an encoder
- * that emits one Opus frame per audio delta and a fake OpenAI socket whose 'message' listener we drive directly.
- * Fake timers pin Date.now so the RtpTimestamper produces a deterministic, gap-free timeline (0, 960, ...).
+ * Talk-boundary tests for TranslatorConnection. The /v1/realtime/translations endpoint streams output-audio deltas
+ * with NO per-utterance boundary event, so a "talk" is a contiguous run of output audio bracketed by onTalkStart
+ * (first emitted frame) and onTalkStop, where the stop is inferred from a silence gap: no output audio for
+ * talkSilenceTimeoutMs ends the talk, and the next delta starts a new one. The harness supplies an encoder that
+ * emits one 3-byte Opus frame per audio delta and a fake OpenAI socket whose 'message' listener we drive directly.
+ * Fake timers pin Date.now so the RtpTimestamper timeline (0, 960, ...) and the silence timer are deterministic.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -13,6 +15,12 @@ import type { TranslationRuntime } from '../../src/translate/runtime';
 // RtpTimestamper defaults: 48000 Hz, 20 ms frames -> 960 ticks/frame, first frame at timestamp 0. Derived from the
 // same exported constants the production code uses so it can't drift if the frame duration ever changes.
 const SAMPLES_PER_FRAME = (RTP_CLOCK_RATE * FRAME_DURATION_MS) / 1000;
+// End-of-talk silence timeout used by the harness (> the RtpTimestamper 100 ms gap threshold). Intentionally a round
+// 300 rather than the 350 production default: these tests exercise the timer mechanism, not the specific value, and
+// drive the fake clock relative to this constant, so any value above the gap threshold works.
+const TALK_TIMEOUT_MS = 300;
+// RTP ticks per ms (48 at 48 kHz); the stop's duration is the [start, stop) span converted with this.
+const TICKS_PER_MS = RTP_CLOCK_RATE / 1000;
 
 interface FakeWs {
 	send: ReturnType<typeof vi.fn>;
@@ -39,7 +47,7 @@ function makeFakeWebSocket(): FakeWs {
 }
 
 /** Runtime whose encoder emits exactly one 3-byte Opus frame per encodeFrame call. */
-function makeHarness(): { runtime: TranslationRuntime; sockets: FakeWs[] } {
+function makeHarness(talkSilenceTimeoutMs = TALK_TIMEOUT_MS): { runtime: TranslationRuntime; sockets: FakeWs[] } {
 	const sockets: FakeWs[] = [];
 	const runtime: TranslationRuntime = {
 		logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -50,6 +58,7 @@ function makeHarness(): { runtime: TranslationRuntime; sockets: FakeWs[] } {
 			debug: false,
 			translationUsageUrl: 'https://usage.test/report',
 			usageReportIntervalMs: 0,
+			talkSilenceTimeoutMs,
 		},
 		writeMetric: () => {},
 		createMetricBatcher: () => ({ increment: () => {}, flush: () => {} }),
@@ -81,7 +90,6 @@ async function flushMicrotasks(): Promise<void> {
 }
 
 const audioDelta = () => JSON.stringify({ type: 'response.output_audio.delta', delta: 'AAAA' });
-const outputAudioDone = () => JSON.stringify({ type: 'response.output_audio.done' });
 const responseDone = () => JSON.stringify({ type: 'response.done' });
 
 describe('TranslatorConnection talk boundaries', () => {
@@ -91,13 +99,13 @@ describe('TranslatorConnection talk boundaries', () => {
 		vi.restoreAllMocks();
 	});
 
-	async function connect(): Promise<{
+	async function connect(talkSilenceTimeoutMs = TALK_TIMEOUT_MS): Promise<{
 		conn: TranslatorConnection;
 		ws: FakeWs;
 		starts: Array<[string, number]>;
 		stops: Array<[string, number, { bytesSent: number; duration: number }]>;
 	}> {
-		const { runtime, sockets } = makeHarness();
+		const { runtime, sockets } = makeHarness(talkSilenceTimeoutMs);
 		const conn = new TranslatorConnection('55555555-a0', { targetLanguage: 'hi' }, runtime);
 		const starts: Array<[string, number]> = [];
 		const stops: Array<[string, number, { bytesSent: number; duration: number }]> = [];
@@ -109,88 +117,140 @@ describe('TranslatorConnection talk boundaries', () => {
 		return { conn, ws: sockets[0], starts, stops };
 	}
 
-	it('brackets a talk: start on the first frame, stop at end-of-utterance', async () => {
+	// Advance the fake clock well past any buffered playout + the silence timeout so the end-of-talk timer fires.
+	// The timer is scheduled for (bufferAheadMs + TALK_TIMEOUT_MS); tests here buffer at most ~1s of media, so a
+	// couple extra seconds of slack unconditionally fires it.
+	const advancePastSilence = () => vi.advanceTimersByTimeAsync(TALK_TIMEOUT_MS + 3000);
+
+	it('brackets a talk: start on the first frame, stop after the output goes silent', async () => {
 		const { ws, starts, stops } = await connect();
 
 		ws.fireMessage(audioDelta()); // first frame -> talk start at ts 0
 		ws.fireMessage(audioDelta()); // second frame at ts 960, still the same talk
 		expect(starts).toEqual([['55555555-a0', 0]]);
-		expect(stops).toEqual([]);
+		expect(stops).toEqual([]); // no boundary event and no silence yet -> talk still open
 
-		ws.fireMessage(responseDone()); // end of utterance -> stop at last frame end (960 + 960)
+		await advancePastSilence(); // output silent for the timeout -> stop at last frame end (960 + 960)
 		// 2 frames of 3 bytes each -> bytesSent 6, duration 2 * 20 ms.
 		expect(stops).toEqual([['55555555-a0', 2 * SAMPLES_PER_FRAME, { bytesSent: 6, duration: 40 }]]);
-		// One talk only.
 		expect(starts).toHaveLength(1);
 	});
 
-	it('stops once on the first end-of-utterance event; a trailing response.done is a no-op', async () => {
+	it('keeps the talk open until a faster-than-real-time burst would finish playing out', async () => {
 		const { ws, starts, stops } = await connect();
 
-		ws.fireMessage(audioDelta()); // talk start at ts 0
-		ws.fireMessage(audioDelta()); // second frame at ts 960
-
-		// The real OpenAI sequence closes a response window with response.output_audio.done *and then*
-		// response.done — both reach the same end-of-utterance handler. The stop must fire on the first, and
-		// endTalk()'s idempotence must make the trailing response.done a no-op (no double-emit).
-		ws.fireMessage(outputAudioDone());
-		expect(stops).toEqual([['55555555-a0', 2 * SAMPLES_PER_FRAME, { bytesSent: 6, duration: 40 }]]);
-
-		ws.fireMessage(responseDone());
-		expect(stops).toHaveLength(1);
+		// 50 frames delivered in one instant = 1 s of media buffered ahead (the burst arrives far faster than it
+		// plays). The talk must stay open for that whole playout, not end a fixed 350 ms after the last frame arrived.
+		for (let i = 0; i < 50; i++) ws.fireMessage(audioDelta());
 		expect(starts).toHaveLength(1);
+
+		// 800 ms is well past the bare silence timeout (350) but far short of the ~1 s of buffered playout — a
+		// frame-arrival timer would have wrongly stopped here.
+		await vi.advanceTimersByTimeAsync(800);
+		expect(stops).toEqual([]);
+
+		// Advance past playout end + the timeout -> exactly one stop, spanning the full 1 s of audio.
+		await vi.advanceTimersByTimeAsync(50 * FRAME_DURATION_MS + TALK_TIMEOUT_MS + 100);
+		expect(stops).toEqual([['55555555-a0', 50 * SAMPLES_PER_FRAME, { bytesSent: 150, duration: 1000 }]]);
 	});
 
-	it('opens a fresh talk for the next response window', async () => {
+	it('does not stop while audio keeps flowing (silence timer is debounced per frame)', async () => {
+		const { ws, starts, stops } = await connect();
+
+		// Four frames spaced under both the RTP gap threshold (100 ms) and the silence timeout (300 ms): the talk
+		// stays open and contiguous the whole time because each frame re-arms the timer.
+		ws.fireMessage(audioDelta());
+		for (let i = 0; i < 3; i++) {
+			await vi.advanceTimersByTimeAsync(50);
+			ws.fireMessage(audioDelta());
+		}
+		expect(starts).toHaveLength(1);
+		expect(stops).toEqual([]);
+
+		await advancePastSilence(); // now silent past the timeout -> one stop for the whole run
+		// 4 contiguous frames: bytesSent 12, span 4 * 20 ms.
+		expect(stops).toEqual([['55555555-a0', 4 * SAMPLES_PER_FRAME, { bytesSent: 12, duration: 80 }]]);
+	});
+
+	it('opens a fresh talk after a silence gap', async () => {
 		const { ws, starts, stops } = await connect();
 
 		ws.fireMessage(audioDelta());
-		ws.fireMessage(responseDone());
+		await advancePastSilence(); // ends talk 1
 		ws.fireMessage(audioDelta());
-		ws.fireMessage(responseDone());
+		await advancePastSilence(); // ends talk 2
 
 		expect(starts).toHaveLength(2);
 		expect(stops).toHaveLength(2);
-		// First talk: one frame at ts 0 -> stop at 960. Second talk: next frame at ts 960 -> stop at 1920.
-		// Each talk is one 3-byte frame -> bytesSent 3, duration 20 ms.
-		expect(starts[0]).toEqual(['55555555-a0', 0]);
-		expect(stops[0]).toEqual(['55555555-a0', SAMPLES_PER_FRAME, { bytesSent: 3, duration: 20 }]);
-		expect(starts[1]).toEqual(['55555555-a0', SAMPLES_PER_FRAME]);
-		expect(stops[1]).toEqual(['55555555-a0', 2 * SAMPLES_PER_FRAME, { bytesSent: 3, duration: 20 }]);
+		// Each talk is one 3-byte frame -> bytesSent 3, duration 20 ms (a single frame's span is always one frame).
+		expect(stops[0][2]).toEqual({ bytesSent: 3, duration: 20 });
+		expect(stops[1][2]).toEqual({ bytesSent: 3, duration: 20 });
+		// The second talk starts after the inserted silence gap, so its start timestamp is past the first's stop.
+		expect(starts[0][1]).toBe(0);
+		expect(starts[1][1]).toBeGreaterThan(stops[0][1]);
 	});
 
-	it('duration is the full [start, stop) span, including a mid-run silence gap', async () => {
+	it('reports the span (incl. a mid-talk gap shorter than the timeout) as duration', async () => {
 		const { ws, stops } = await connect();
 
-		ws.fireMessage(audioDelta()); // frame 1 at ts 0 (talk start)
-		// Advance the clock past the gap threshold (100 ms) so the RtpTimestamper inserts a silence jump before the
-		// next frame — the run's span then far exceeds the 2 frames of actual audio.
-		await vi.advanceTimersByTimeAsync(500);
+		ws.fireMessage(audioDelta()); // frame 1 at ts 0
+		// A gap longer than the RtpTimestamper threshold (100 ms) but shorter than the silence timeout (300 ms): the
+		// RTP timeline jumps, but the talk stays open, so its span exceeds the 2 frames of actual audio.
+		await vi.advanceTimersByTimeAsync(150);
 		ws.fireMessage(audioDelta()); // frame 2 at a jumped-forward ts
-		ws.fireMessage(responseDone());
+		await advancePastSilence();
 
 		expect(stops).toHaveLength(1);
 		const [tag, stopTs, mediaInfo] = stops[0];
 		expect(tag).toBe('55555555-a0');
-		// bytesSent is the real audio (2 * 3 bytes). duration is the [start, stop) span: the talk started at ts 0,
-		// so duration == stopTs converted to ms (48 ticks/ms) — it absorbs the inserted gap and is far more than the
-		// 2 * 20 ms of actual audio.
+		// bytesSent is the real audio (2 * 3 bytes). duration is the [start, stop) span (start ts 0), so it equals
+		// stopTs converted to ms and absorbs the gap — far more than the 2 * 20 ms of actual audio.
 		expect(mediaInfo.bytesSent).toBe(6);
-		expect(mediaInfo.duration).toBe(Math.round(stopTs / 48));
+		expect(mediaInfo.duration).toBe(Math.round(stopTs / TICKS_PER_MS));
 		expect(stopTs).toBeGreaterThan(2 * SAMPLES_PER_FRAME);
 		expect(mediaInfo.duration).toBeGreaterThan(40);
 	});
 
-	it('does not emit a stop for a response window that produced no audio', async () => {
+	it('a done event ends the talk early (defensive path for the general /v1/realtime endpoint)', async () => {
 		const { ws, starts, stops } = await connect();
-		ws.fireMessage(responseDone()); // no audio delta -> no talk was started
+
+		ws.fireMessage(audioDelta()); // talk start at ts 0
+		ws.fireMessage(audioDelta()); // second frame at ts 960
+		// The translations endpoint never sends this, but if pointed at the general endpoint a response.done ends
+		// the talk immediately (rather than waiting for the silence timer), and cancels the pending timer.
+		ws.fireMessage(responseDone());
+		expect(stops).toEqual([['55555555-a0', 2 * SAMPLES_PER_FRAME, { bytesSent: 6, duration: 40 }]]);
+
+		// The silence timer must not then fire a second stop.
+		await advancePastSilence();
+		expect(stops).toHaveLength(1);
+		expect(starts).toHaveLength(1);
+	});
+
+	it('does not emit a stop when there is no output audio', async () => {
+		const { starts, stops } = await connect();
+		await advancePastSilence(); // silence with no prior audio -> no talk was ever started
 		expect(starts).toEqual([]);
 		expect(stops).toEqual([]);
 	});
 
+	it('with the timeout disabled (<= 0) never ends a talk on silence, only at close', async () => {
+		const { conn, ws, starts, stops } = await connect(0);
+
+		ws.fireMessage(audioDelta());
+		expect(starts).toHaveLength(1);
+		// No silence timer is armed, so even a long silence produces no stop.
+		await vi.advanceTimersByTimeAsync(60_000);
+		expect(stops).toEqual([]);
+
+		// The talk only ends when the connection tears down.
+		conn.close();
+		expect(stops).toHaveLength(1);
+	});
+
 	it('closes an in-progress talk when the connection closes', async () => {
 		const { conn, ws, starts, stops } = await connect();
-		ws.fireMessage(audioDelta()); // talk started, no end-of-utterance yet
+		ws.fireMessage(audioDelta()); // talk started, still open
 		expect(starts).toHaveLength(1);
 		expect(stops).toEqual([]);
 
