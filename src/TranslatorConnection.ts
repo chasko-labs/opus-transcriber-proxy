@@ -750,7 +750,7 @@ export class TranslatorConnection {
 		// The RtpTimestamper produces a monotonic RTP timestamp (inserting a real-silence gap when the
 		// source idled longer than the buffered media) and a uint16 RTP sequence number. JVB's
 		// Conference.handleMediaMessage reinterprets `media.chunk` as that 16-bit RTP sequence number.
-		const { timestamp, sequenceNumber: rtpSequenceNumber } = this.rtpTimestamper.nextFrameTimestamp();
+		const { timestamp, sequenceNumber: rtpSequenceNumber, bufferAheadMs } = this.rtpTimestamper.nextFrameTimestamp();
 
 		// First frame of a talk: emit the talk-start boundary at this frame's timestamp, and reset the run's
 		// mediaInfo accumulators. The end-of-utterance handler emits the matching talk-stop. Uses its own flag
@@ -763,8 +763,11 @@ export class TranslatorConnection {
 		}
 		this.lastFrameTimestamp = timestamp;
 		this.talkBytes += opusFrame.length;
-		// (Re)arm the silence timer: the talk ends once no further output audio arrives for talkSilenceTimeoutMs.
-		this.armTalkSilenceTimer();
+		// (Re)arm the silence timer against the MEDIA playout, not frame arrival: OpenAI streams faster than real
+		// time (a 2 s utterance can arrive in ~200 ms), so the consumer is still playing out the buffered burst long
+		// after the last frame arrives. Wait until that buffered media would finish playing (bufferAheadMs) plus the
+		// silence margin before ending the talk.
+		this.armTalkSilenceTimer(bufferAheadMs);
 
 		const payload = bytesToBase64(opusFrame);
 
@@ -774,17 +777,19 @@ export class TranslatorConnection {
 
 	/**
 	 * (Re)arm the end-of-talk silence timer. The /v1/realtime/translations endpoint streams output-audio deltas with
-	 * no per-utterance boundary event, so a talk is ended when the output has been silent for talkSilenceTimeoutMs;
-	 * the next frame starts a fresh talk. Called on every emitted frame (debounce). A non-positive timeout disables
-	 * inference (a talk then ends only on a done event, if the endpoint sends one, or at close).
+	 * no per-utterance boundary event, so a talk is ended when the output goes silent; the next frame starts a fresh
+	 * talk. Called on every emitted frame (debounce). The delay is measured from the projected MEDIA playout end
+	 * (`bufferAheadMs`, how long the already-emitted burst will still be playing) plus `talkSilenceTimeoutMs` of
+	 * silence beyond it — so a faster-than-real-time burst doesn't end the talk while the consumer is still playing
+	 * it out. A non-positive timeout disables inference (a talk then ends only on a done event, if any, or at close).
 	 */
-	private armTalkSilenceTimer(): void {
+	private armTalkSilenceTimer(bufferAheadMs: number): void {
 		if (this.talkTimeout !== undefined) {
 			clearTimeout(this.talkTimeout);
 			this.talkTimeout = undefined;
 		}
 		if (this.talkSilenceTimeoutMs > 0) {
-			this.talkTimeout = setTimeout(() => this.endTalk(), this.talkSilenceTimeoutMs);
+			this.talkTimeout = setTimeout(() => this.endTalk(), bufferAheadMs + this.talkSilenceTimeoutMs);
 			// Don't keep the process alive solely for this timer (Node's Timeout has unref; the Worker's id doesn't).
 			(this.talkTimeout as unknown as { unref?: () => void }).unref?.();
 		}

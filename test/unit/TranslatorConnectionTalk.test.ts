@@ -115,8 +115,10 @@ describe('TranslatorConnection talk boundaries', () => {
 		return { conn, ws: sockets[0], starts, stops };
 	}
 
-	// Advance the fake clock past the silence timeout so the end-of-talk timer fires.
-	const advancePastSilence = () => vi.advanceTimersByTimeAsync(TALK_TIMEOUT_MS);
+	// Advance the fake clock well past any buffered playout + the silence timeout so the end-of-talk timer fires.
+	// The timer is scheduled for (bufferAheadMs + TALK_TIMEOUT_MS); tests here buffer at most ~1s of media, so a
+	// couple extra seconds of slack unconditionally fires it.
+	const advancePastSilence = () => vi.advanceTimersByTimeAsync(TALK_TIMEOUT_MS + 3000);
 
 	it('brackets a talk: start on the first frame, stop after the output goes silent', async () => {
 		const { ws, starts, stops } = await connect();
@@ -130,6 +132,24 @@ describe('TranslatorConnection talk boundaries', () => {
 		// 2 frames of 3 bytes each -> bytesSent 6, duration 2 * 20 ms.
 		expect(stops).toEqual([['55555555-a0', 2 * SAMPLES_PER_FRAME, { bytesSent: 6, duration: 40 }]]);
 		expect(starts).toHaveLength(1);
+	});
+
+	it('keeps the talk open until a faster-than-real-time burst would finish playing out', async () => {
+		const { ws, starts, stops } = await connect();
+
+		// 50 frames delivered in one instant = 1 s of media buffered ahead (the burst arrives far faster than it
+		// plays). The talk must stay open for that whole playout, not end a fixed 350 ms after the last frame arrived.
+		for (let i = 0; i < 50; i++) ws.fireMessage(audioDelta());
+		expect(starts).toHaveLength(1);
+
+		// 800 ms is well past the bare silence timeout (350) but far short of the ~1 s of buffered playout — a
+		// frame-arrival timer would have wrongly stopped here.
+		await vi.advanceTimersByTimeAsync(800);
+		expect(stops).toEqual([]);
+
+		// Advance past playout end + the timeout -> exactly one stop, spanning the full 1 s of audio.
+		await vi.advanceTimersByTimeAsync(50 * FRAME_DURATION_MS + TALK_TIMEOUT_MS + 100);
+		expect(stops).toEqual([['55555555-a0', 50 * SAMPLES_PER_FRAME, { bytesSent: 150, duration: 1000 }]]);
 	});
 
 	it('does not stop while audio keeps flowing (silence timer is debounced per frame)', async () => {

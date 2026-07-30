@@ -53,6 +53,14 @@ export interface RtpFrameTiming {
 	timestamp: number;
 	/** uint16 RTP sequence number (wraps at 0xffff). */
 	sequenceNumber: number;
+	/**
+	 * How far ahead of real time the emitted media is buffered, in ms: the wall-clock interval from now until the
+	 * media emitted through this frame would finish playing (`playoutEndWall - now`, clamped at 0). Because the
+	 * source (OpenAI) streams faster than real time, this is typically well above one frame — the consumer plays the
+	 * burst out over media time. Callers use it to schedule end-of-stream work against the media playout, not against
+	 * frame arrival.
+	 */
+	bufferAheadMs: number;
 }
 
 export class RtpTimestamper {
@@ -99,6 +107,8 @@ export class RtpTimestamper {
 		this.playoutEndWall += this.frameDurationMs;
 
 		this.sequenceNumber = (this.sequenceNumber + 1) & 0xffff;
-		return { timestamp, sequenceNumber: this.sequenceNumber };
+		// How long from now until the media buffered so far (through this frame) finishes playing.
+		const bufferAheadMs = Math.max(0, this.playoutEndWall - now);
+		return { timestamp, sequenceNumber: this.sequenceNumber, bufferAheadMs };
 	}
 }

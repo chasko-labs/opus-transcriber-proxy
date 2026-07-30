@@ -72,10 +72,11 @@ export interface TranslationRuntimeConfig {
 	/**
 	 * Silence timeout (ms) used to detect the end of a translated-audio "talk". The
 	 * /v1/realtime/translations endpoint emits a boundary-less stream of output-audio deltas with no
-	 * per-utterance done event, so a talk is considered ended when no output audio has been produced for
-	 * this long; the next delta starts a new talk. Default 350. Must exceed the RtpTimestamper gap
-	 * threshold (100ms) so a new talk begins after a real silence gap. Resolved by each runtime from its
-	 * environment.
+	 * per-utterance done event, so a talk is considered ended when the output goes silent. Measured from the
+	 * projected MEDIA playout end (OpenAI streams faster than real time, so the consumer keeps playing a burst
+	 * after the last frame arrives): the talk ends this long after the buffered audio would finish playing, and
+	 * the next delta starts a new talk. Default 350. Must exceed the RtpTimestamper gap threshold (100ms) so a
+	 * new talk begins after a real silence gap. Resolved by each runtime from its environment.
 	 */
 	talkSilenceTimeoutMs?: number;
 }
