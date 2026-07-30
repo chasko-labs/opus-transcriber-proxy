@@ -34,9 +34,10 @@ const REPO_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const SAMPLE_DUMP = path.join(REPO_ROOT, 'resources', 'sample.jsonl');
 const CONTAINER_IMAGE = process.env.INTEGRATION_TEST_IMAGE || 'opus-transcriber-proxy';
 // worker/package.json pins the wrangler version this repo is tested against — prefer it over
-// whatever (if anything) is on PATH.
+// whatever (if anything) is on PATH. Otherwise fall back to `npx wrangler` rather than a bare `wrangler`:
+// a bare `wrangler` isn't on PATH after a local `npm install`, so spawning it directly ENOENTs.
 const LOCAL_WRANGLER = path.join(REPO_ROOT, 'worker', 'node_modules', '.bin', 'wrangler');
-const WRANGLER_BIN = existsSync(LOCAL_WRANGLER) ? LOCAL_WRANGLER : 'wrangler';
+const WRANGLER_ARGV = existsSync(LOCAL_WRANGLER) ? [LOCAL_WRANGLER] : ['npx', 'wrangler'];
 
 const PROVIDER_KEY_ENV = {
 	openai: 'OPENAI_API_KEY',
@@ -243,8 +244,8 @@ async function startWorker({ port, endpoint, provider, translateLang }) {
 	// --inspector-port=0: let the OS pick a free port for the devtools inspector instead of
 	// wrangler's fixed default (9229), which could collide with something else on the runner.
 	const wranglerArgs = ['dev', '--config', config, '--port', String(port), '--inspector-port', '0', '--env-file', envFile];
-	log(`${WRANGLER_BIN} ${wranglerArgs.join(' ')} (config=${config})`);
-	const proc = spawn(WRANGLER_BIN, wranglerArgs, { cwd: REPO_ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
+	log(`${WRANGLER_ARGV.join(' ')} ${wranglerArgs.join(' ')} (config=${config})`);
+	const proc = spawn(WRANGLER_ARGV[0], [...WRANGLER_ARGV.slice(1), ...wranglerArgs], { cwd: REPO_ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
 
 	async function stop() {
 		log('Stopping wrangler dev');
@@ -307,7 +308,12 @@ async function main() {
 			'--connect-timeout=15',
 		];
 		if (args.endpoint === 'translate') {
-			replayArgs.push(`--translate=${args.translateLang}`, '--assert-min-media=1');
+			// Assert translated audio AND a final transcript come back. The finals assertion guards the
+			// transcript end-of-utterance detection: the /v1/realtime/translations endpoint emits no per-utterance
+			// boundary event, so the final is inferred from the output-audio silence timer — without that, finals
+			// is 0. (Not --assert-min-interims: the URL is sendBack-only, so interims aren't forwarded to the client;
+			// only finals are. It counts finals, not their text — a truncated final would still pass.)
+			replayArgs.push(`--translate=${args.translateLang}`, '--assert-min-media=1', '--assert-min-finals=1');
 		} else if (args.provider !== 'dummy') {
 			// The dummy backend never emits transcripts (see src/backends/DummyBackend.ts) — its run
 			// only proves the decode/wiring path survives cleanly, so it asserts nothing beyond --ci's

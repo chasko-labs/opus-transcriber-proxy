@@ -100,22 +100,23 @@ describe('TranslatorConnection transcript finalization', () => {
 
 	const advancePastSilence = () => vi.advanceTimersByTimeAsync(TALK_TIMEOUT_MS + 3000);
 
-	it('finalizes the transcript at the silence boundary when no transcript-done arrives', async () => {
+	it('accumulates fragment deltas and finalizes the whole utterance at the silence boundary', async () => {
 		const { ws, transcripts } = await connect();
 
 		ws.fireMessage(audioDelta()); // start a talk (arms the silence timer)
-		ws.fireMessage(transcriptDelta('hola')); // interim
-		ws.fireMessage(transcriptDelta('hola mundo')); // interim (growing hypothesis)
+		// Deltas are incremental fragments, not a cumulative hypothesis — each is forwarded verbatim as an interim.
+		ws.fireMessage(transcriptDelta('hola'));
+		ws.fireMessage(transcriptDelta(' mundo'));
 		expect(transcripts).toEqual([
 			['hola', true],
-			['hola mundo', true],
+			[' mundo', true],
 		]);
 
-		await advancePastSilence(); // silence timer fires -> finalize the last interim
+		await advancePastSilence(); // silence timer fires -> finalize the CONCATENATION of the fragments
 		expect(transcripts).toEqual([
 			['hola', true],
-			['hola mundo', true],
-			['hola mundo', false], // final
+			[' mundo', true],
+			['hola mundo', false], // final = accumulated run, not just the last fragment
 		]);
 	});
 

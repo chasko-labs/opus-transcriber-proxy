@@ -169,10 +169,12 @@ export class TranslatorConnection {
 	private lastFrameTimestamp = 0;
 	private talkStartTimestamp = 0;
 	private talkBytes = 0;
-	// The most recent interim transcript emitted for the current run, or null if none pending / already finalized.
-	// The /v1/realtime/translations endpoint sends no transcript-done event, so this is emitted as the final at the
-	// talk-stop boundary (finalizePendingTranscript). See the transcript handling in handleOpenAIMessage.
-	private lastInterimTranscript: string | null = null;
+	// Accumulated transcript for the current run. The /v1/realtime/translations endpoint streams
+	// session.output_transcript.delta events that are INCREMENTAL FRAGMENTS (append-only, e.g. " sin", "color",
+	// "periód", "ica") — NOT a cumulative hypothesis — and it sends no transcript-done event. So the fragments are
+	// concatenated here and the whole run is emitted as the final at the talk-stop boundary (finalizePendingTranscript),
+	// then reset. Empty when nothing is pending. See the transcript handling in handleOpenAIMessage.
+	private transcriptBuffer = '';
 	// Debounce timer that ends the talk after talkSilenceTimeoutMs of no output audio (re-armed on each frame).
 	private talkTimeout?: ReturnType<typeof setTimeout>;
 	// End-of-talk silence timeout in ms; 0 disables inference (only a done event / close ends a talk). Set in the ctor.
@@ -677,13 +679,13 @@ export class TranslatorConnection {
 			parsedMessage.type === 'session.output_transcript.delta'
 			|| parsedMessage.type === 'response.output_audio_transcript.delta'
 		) {
-			// Deltas are the growing hypothesis → interim. The consumer (server.ts) gates on
-			// `sendBack`/`sendBackInterim` and forwards to the client. Suppressed when transcripts disabled.
+			// Deltas are incremental fragments (append-only), not a cumulative hypothesis. Forward each as an
+			// interim (server.ts gates on `sendBack`/`sendBackInterim`) and concatenate into the run buffer so the
+			// whole utterance can be emitted as the final at the talk-stop boundary (the translations endpoint sends
+			// no transcript-done event; see finalizePendingTranscript). Suppressed when transcripts disabled.
 			if (this.runtime.config.emitTranscripts && typeof parsedMessage.delta === 'string' && parsedMessage.delta) {
 				this.onTranscription?.(parsedMessage.delta, this.options.targetLanguage, /* isInterim */ true);
-				// Remember the latest hypothesis so it can be emitted as the final at the talk-stop boundary (the
-				// translations endpoint sends no transcript-done event; see finalizePendingTranscript).
-				this.lastInterimTranscript = parsedMessage.delta;
+				this.transcriptBuffer += parsedMessage.delta;
 			}
 			return;
 		}
@@ -703,10 +705,10 @@ export class TranslatorConnection {
 			if (typeof transcript === 'string' && transcript) {
 				this.log(`[${this.options.targetLanguage}] ${parsedMessage.type}: ${transcript}`);
 				if (this.runtime.config.emitTranscripts) {
-					// The transcript-done event is the authoritative full utterance → final. Clear the pending
-					// interim so finalizePendingTranscript() doesn't re-emit a duplicate final at talk-stop.
+					// The transcript-done event is the authoritative full utterance → final. Discard the accumulated
+					// buffer so finalizePendingTranscript() doesn't re-emit a duplicate final at talk-stop.
 					this.onTranscription?.(transcript, this.options.targetLanguage, /* isInterim */ false);
-					this.lastInterimTranscript = null;
+					this.transcriptBuffer = '';
 				}
 			} else if (this.runtime.config.emitTranscripts) {
 				// A transcript-done event with no extractable text usually means OpenAI changed the response
@@ -807,18 +809,19 @@ export class TranslatorConnection {
 	}
 
 	/**
-	 * Emit the accumulated transcript hypothesis as the final for the run, if one is pending. The
-	 * /v1/realtime/translations endpoint sends no transcript-done event, so — like the audio talk-stop — the
-	 * transcript is finalized at the silence boundary (and at close). Re-emits the last interim with
-	 * isInterim=false; on the general /v1/realtime endpoint the transcript-done handler emits the authoritative
-	 * final and clears the pending interim first, so this is a no-op there. (Only set when emitTranscripts is on.)
+	 * Emit the accumulated transcript for the run as the final, if any fragments are buffered, and reset the buffer.
+	 * The /v1/realtime/translations endpoint sends no transcript-done event, so — like the audio talk-stop — the
+	 * transcript is finalized at the silence boundary (and at close), emitting the concatenation of the run's
+	 * fragment deltas with isInterim=false. On the general /v1/realtime endpoint the transcript-done handler emits
+	 * the authoritative final and clears the buffer first, so this is a no-op there. (Buffer only grows when
+	 * emitTranscripts is on.)
 	 */
 	private finalizePendingTranscript(): void {
-		if (this.lastInterimTranscript === null) {
+		if (this.transcriptBuffer === '') {
 			return;
 		}
-		const transcript = this.lastInterimTranscript;
-		this.lastInterimTranscript = null;
+		const transcript = this.transcriptBuffer;
+		this.transcriptBuffer = '';
 		this.onTranscription?.(transcript, this.options.targetLanguage, /* isInterim */ false);
 	}
 
