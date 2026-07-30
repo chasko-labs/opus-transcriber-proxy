@@ -175,8 +175,11 @@ export class TranslatorConnection {
 	// concatenated here and the whole run is emitted as the final at the talk-stop boundary (finalizePendingTranscript),
 	// then reset. Empty when nothing is pending. See the transcript handling in handleOpenAIMessage.
 	private transcriptBuffer = '';
-	// Debounce timer that ends the talk after talkSilenceTimeoutMs of no output audio (re-armed on each frame).
+	// Debounce timer that ends the talk once BOTH output audio and (when enabled) the transcript have gone quiet
+	// for talkSilenceTimeoutMs; re-armed on each audio frame and each transcript delta. talkDeadline is its absolute
+	// wall-clock target, used to avoid a zero-playout transcript delta shortening a timer set from buffered audio.
 	private talkTimeout?: ReturnType<typeof setTimeout>;
+	private talkDeadline = 0;
 	// End-of-talk silence timeout in ms; 0 disables inference (only a done event / close ends a talk). Set in the ctor.
 	private readonly talkSilenceTimeoutMs: number;
 
@@ -686,6 +689,9 @@ export class TranslatorConnection {
 			if (this.runtime.config.emitTranscripts && typeof parsedMessage.delta === 'string' && parsedMessage.delta) {
 				this.onTranscription?.(parsedMessage.delta, this.options.targetLanguage, /* isInterim */ true);
 				this.transcriptBuffer += parsedMessage.delta;
+				// Extend the talk so it doesn't end (finalizing the transcript / emitting the audio stop) while the
+				// transcript is still streaming past the audio. playoutAhead is 0 — text has no playout.
+				this.armTalkSilenceTimer(0);
 			}
 			return;
 		}
@@ -789,23 +795,32 @@ export class TranslatorConnection {
 	}
 
 	/**
-	 * (Re)arm the end-of-talk silence timer. The /v1/realtime/translations endpoint streams output-audio deltas with
-	 * no per-utterance boundary event, so a talk is ended when the output goes silent; the next frame starts a fresh
-	 * talk. Called on every emitted frame (debounce). The delay is measured from the projected MEDIA playout end
-	 * (`bufferAheadMs`, how long the already-emitted burst will still be playing) plus `talkSilenceTimeoutMs` of
-	 * silence beyond it — so a faster-than-real-time burst doesn't end the talk while the consumer is still playing
-	 * it out. A non-positive timeout disables inference (a talk then ends only on a done event, if any, or at close).
+	 * (Re)arm the end-of-talk silence timer. The /v1/realtime/translations endpoint streams output-audio and
+	 * output-transcript deltas with no per-utterance boundary event, so a talk is ended once BOTH have gone silent:
+	 * armed from each audio frame and (when transcripts are enabled) each transcript delta, so the audio sending-change
+	 * and the transcript final stay aligned to one boundary and a trailing transcript is not orphaned.
+	 *
+	 * `playoutAheadMs` is how far the projected MEDIA playout extends beyond now: `bufferAheadMs` for an audio frame
+	 * (so a faster-than-real-time burst isn't ended while the consumer is still playing it out), 0 for a transcript
+	 * delta (text has no playout). The deadline is `now + playoutAheadMs + talkSilenceTimeoutMs`. A pending timer is
+	 * only ever EXTENDED, never shortened — a zero-playout transcript delta must not cut a timer set from buffered
+	 * audio; the talk ends at the later of the two streams' quiet points. Non-positive timeout disables inference.
 	 */
-	private armTalkSilenceTimer(bufferAheadMs: number): void {
+	private armTalkSilenceTimer(playoutAheadMs: number): void {
+		if (this.talkSilenceTimeoutMs <= 0) {
+			return;
+		}
+		const deadline = Date.now() + playoutAheadMs + this.talkSilenceTimeoutMs;
+		if (this.talkTimeout !== undefined && deadline <= this.talkDeadline) {
+			return; // keep the later pending timer (don't let this source shorten it)
+		}
 		if (this.talkTimeout !== undefined) {
 			clearTimeout(this.talkTimeout);
-			this.talkTimeout = undefined;
 		}
-		if (this.talkSilenceTimeoutMs > 0) {
-			this.talkTimeout = setTimeout(() => this.endTalk(), bufferAheadMs + this.talkSilenceTimeoutMs);
-			// Don't keep the process alive solely for this timer (Node's Timeout has unref; the Worker's id doesn't).
-			(this.talkTimeout as unknown as { unref?: () => void }).unref?.();
-		}
+		this.talkDeadline = deadline;
+		this.talkTimeout = setTimeout(() => this.endTalk(), playoutAheadMs + this.talkSilenceTimeoutMs);
+		// Don't keep the process alive solely for this timer (Node's Timeout has unref; the Worker's id doesn't).
+		(this.talkTimeout as unknown as { unref?: () => void }).unref?.();
 	}
 
 	/**

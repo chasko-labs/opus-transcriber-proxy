@@ -151,4 +151,48 @@ describe('TranslatorConnection transcript finalization', () => {
 		await advancePastSilence();
 		expect(transcripts).toEqual([]);
 	});
+
+	it('holds the transcript final until the audio has played out (both burst in faster than real time)', async () => {
+		const { conn, ws, transcripts } = await connect();
+		const stops: Array<[string, number]> = [];
+		conn.onTalkStop = (tag, ts) => stops.push([tag, ts]);
+
+		// A burst: ~1 s of audio (50 frames) AND the whole transcript arrive at once, far faster than real time.
+		for (let i = 0; i < 50; i++) ws.fireMessage(audioDelta());
+		ws.fireMessage(transcriptDelta('hola'));
+		ws.fireMessage(transcriptDelta(' mundo'));
+
+		// The transcript has already stopped, but the audio is still "playing out" (~1 s buffered). Well past the
+		// bare silence timeout (300 ms) yet short of the playout — nothing is finalized: the transcript's own short
+		// deadline does NOT shorten the audio-playout timer.
+		await vi.advanceTimersByTimeAsync(800);
+		expect(transcripts.filter(([, isInterim]) => !isInterim)).toEqual([]);
+		expect(stops).toEqual([]);
+
+		// Past the audio playout end + the timeout: the audio stop and the transcript final fire together.
+		await vi.advanceTimersByTimeAsync(50 * 20 + TALK_TIMEOUT_MS + 100);
+		expect(stops).toHaveLength(1);
+		expect(transcripts.filter(([, isInterim]) => !isInterim)).toEqual([['hola mundo', false]]);
+	});
+
+	it('extends the talk when the transcript trails past the audio (no orphaned trailing final)', async () => {
+		const { conn, ws, transcripts } = await connect();
+		const stops: Array<[string, number]> = [];
+		conn.onTalkStop = (tag, ts) => stops.push([tag, ts]);
+
+		ws.fireMessage(audioDelta()); // one frame: audio alone would end ~320 ms later
+		// Transcript deltas keep arriving, each < the timeout apart, past where the audio alone would have ended.
+		for (const frag of ['a', 'b', 'c']) {
+			await vi.advanceTimersByTimeAsync(250);
+			ws.fireMessage(transcriptDelta(frag));
+		}
+		// Still open — the trailing transcript extended the talk rather than being cut off.
+		expect(stops).toEqual([]);
+		expect(transcripts.filter(([, isInterim]) => !isInterim)).toEqual([]);
+
+		await vi.advanceTimersByTimeAsync(TALK_TIMEOUT_MS + 100);
+		// One stop, and the final holds the whole trailing transcript (nothing orphaned into a later segment).
+		expect(stops).toHaveLength(1);
+		expect(transcripts.filter(([, isInterim]) => !isInterim)).toEqual([['abc', false]]);
+	});
 });
