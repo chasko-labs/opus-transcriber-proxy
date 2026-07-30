@@ -169,6 +169,10 @@ export class TranslatorConnection {
 	private lastFrameTimestamp = 0;
 	private talkStartTimestamp = 0;
 	private talkBytes = 0;
+	// The most recent interim transcript emitted for the current run, or null if none pending / already finalized.
+	// The /v1/realtime/translations endpoint sends no transcript-done event, so this is emitted as the final at the
+	// talk-stop boundary (finalizePendingTranscript). See the transcript handling in handleOpenAIMessage.
+	private lastInterimTranscript: string | null = null;
 	// Debounce timer that ends the talk after talkSilenceTimeoutMs of no output audio (re-armed on each frame).
 	private talkTimeout?: ReturnType<typeof setTimeout>;
 	// End-of-talk silence timeout in ms; 0 disables inference (only a done event / close ends a talk). Set in the ctor.
@@ -677,13 +681,17 @@ export class TranslatorConnection {
 			// `sendBack`/`sendBackInterim` and forwards to the client. Suppressed when transcripts disabled.
 			if (this.runtime.config.emitTranscripts && typeof parsedMessage.delta === 'string' && parsedMessage.delta) {
 				this.onTranscription?.(parsedMessage.delta, this.options.targetLanguage, /* isInterim */ true);
+				// Remember the latest hypothesis so it can be emitted as the final at the talk-stop boundary (the
+				// translations endpoint sends no transcript-done event; see finalizePendingTranscript).
+				this.lastInterimTranscript = parsedMessage.delta;
 			}
 			return;
 		}
 
-		// Final transcript. Emitted only from the transcript-done events so it fires once per utterance — the
-		// /v1/realtime/translations endpoint sends both session.output_transcript.done and response.done for the
-		// same utterance, and the audio-done events (below) carry no transcript.
+		// Final transcript from an explicit transcript-done event. The /v1/realtime/translations endpoint does NOT
+		// send this (it emits only session.output_transcript.delta), so on that endpoint the final is emitted
+		// instead by finalizePendingTranscript() at the talk-stop silence boundary. This branch is the general
+		// /v1/realtime path, where the done event carries the authoritative full utterance.
 		if (
 			parsedMessage.type === 'session.output_transcript.done'
 			|| parsedMessage.type === 'response.output_audio_transcript.done'
@@ -695,8 +703,10 @@ export class TranslatorConnection {
 			if (typeof transcript === 'string' && transcript) {
 				this.log(`[${this.options.targetLanguage}] ${parsedMessage.type}: ${transcript}`);
 				if (this.runtime.config.emitTranscripts) {
-					// The transcript-done event is the authoritative full utterance → final.
+					// The transcript-done event is the authoritative full utterance → final. Clear the pending
+					// interim so finalizePendingTranscript() doesn't re-emit a duplicate final at talk-stop.
 					this.onTranscription?.(transcript, this.options.targetLanguage, /* isInterim */ false);
+					this.lastInterimTranscript = null;
 				}
 			} else if (this.runtime.config.emitTranscripts) {
 				// A transcript-done event with no extractable text usually means OpenAI changed the response
@@ -796,12 +806,31 @@ export class TranslatorConnection {
 		}
 	}
 
+	/**
+	 * Emit the accumulated transcript hypothesis as the final for the run, if one is pending. The
+	 * /v1/realtime/translations endpoint sends no transcript-done event, so — like the audio talk-stop — the
+	 * transcript is finalized at the silence boundary (and at close). Re-emits the last interim with
+	 * isInterim=false; on the general /v1/realtime endpoint the transcript-done handler emits the authoritative
+	 * final and clears the pending interim first, so this is a no-op there. (Only set when emitTranscripts is on.)
+	 */
+	private finalizePendingTranscript(): void {
+		if (this.lastInterimTranscript === null) {
+			return;
+		}
+		const transcript = this.lastInterimTranscript;
+		this.lastInterimTranscript = null;
+		this.onTranscription?.(transcript, this.options.targetLanguage, /* isInterim */ false);
+	}
+
 	/** Emit the talk-stop boundary if a talk is in progress. Idempotent (a no-op when no talk is active). */
 	private endTalk(): void {
 		if (this.talkTimeout !== undefined) {
 			clearTimeout(this.talkTimeout);
 			this.talkTimeout = undefined;
 		}
+		// Finalize the transcript at the same boundary (before the talkActive guard, so a pending interim is still
+		// flushed at close even if no audio talk is active).
+		this.finalizePendingTranscript();
 		if (!this.talkActive) {
 			return;
 		}
