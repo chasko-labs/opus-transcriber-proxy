@@ -53,7 +53,8 @@ function buildContainerEnvVars(env: Env): Record<string, string> {
 		...(env.ENABLE_TRANSLATE && { ENABLE_TRANSLATE: env.ENABLE_TRANSLATE }),
 		...(env.TRANSLATE_TRANSCRIPTS && { TRANSLATE_TRANSCRIPTS: env.TRANSLATE_TRANSCRIPTS }),
 		// Forwarded only when set so the container default (350) applies otherwise; matches the other translation
-		// tunables above (the /translate path runs in the container too).
+		// tunables above (the /translate path runs in the container too). "0" (disable) is a non-empty string →
+		// truthy → still forwarded.
 		...(env.TRANSLATION_TALK_SILENCE_TIMEOUT_MS && { TRANSLATION_TALK_SILENCE_TIMEOUT_MS: env.TRANSLATION_TALK_SILENCE_TIMEOUT_MS }),
 		GEMINI_API_KEY: env.GEMINI_API_KEY || '',
 		DEEPGRAM_API_KEY: env.DEEPGRAM_API_KEY || '',
