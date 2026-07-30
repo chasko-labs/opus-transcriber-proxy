@@ -157,7 +157,7 @@ describe('TranslatorConnection transcript finalization', () => {
 		const stops: Array<[string, number]> = [];
 		conn.onTalkStop = (tag, ts) => stops.push([tag, ts]);
 
-		// A burst: ~1 s of audio (50 frames) AND the whole transcript arrive at once, far faster than real time.
+		// A burst: ~1 s of audio (50 frames × 20 ms) AND the whole transcript arrive at once, faster than real time.
 		for (let i = 0; i < 50; i++) ws.fireMessage(audioDelta());
 		ws.fireMessage(transcriptDelta('hola'));
 		ws.fireMessage(transcriptDelta(' mundo'));

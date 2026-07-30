@@ -690,7 +690,10 @@ export class TranslatorConnection {
 				this.onTranscription?.(parsedMessage.delta, this.options.targetLanguage, /* isInterim */ true);
 				this.transcriptBuffer += parsedMessage.delta;
 				// Extend the talk so it doesn't end (finalizing the transcript / emitting the audio stop) while the
-				// transcript is still streaming past the audio. playoutAhead is 0 — text has no playout.
+				// transcript is still streaming past the audio. playoutAhead is 0 — text has no playout. This also
+				// arms the timer when no audio talk is active (a transcript before the first audio frame, or a late
+				// fragment after a talk ended): the buffered transcript then finalizes on its own silence with no
+				// audio stop — preferable to attaching a stray trailing fragment to the next utterance's final.
 				this.armTalkSilenceTimer(0);
 			}
 			return;
@@ -845,6 +848,7 @@ export class TranslatorConnection {
 		if (this.talkTimeout !== undefined) {
 			clearTimeout(this.talkTimeout);
 			this.talkTimeout = undefined;
+			this.talkDeadline = 0; // keep the invariant obvious: no pending timer ⇒ no live deadline
 		}
 		// Finalize the transcript at the same boundary (before the talkActive guard, so a pending interim is still
 		// flushed at close even if no audio talk is active).
