@@ -69,6 +69,15 @@ export interface TranslationRuntimeConfig {
 	 * (only the final delta at close is reported). Resolved by each runtime from its environment.
 	 */
 	usageReportIntervalMs?: number;
+	/**
+	 * Silence timeout (ms) used to detect the end of a translated-audio "talk". The
+	 * /v1/realtime/translations endpoint emits a boundary-less stream of output-audio deltas with no
+	 * per-utterance done event, so a talk is considered ended when no output audio has been produced for
+	 * this long; the next delta starts a new talk. Default 350. Must exceed the RtpTimestamper gap
+	 * threshold (100ms) so a new talk begins after a real silence gap. Resolved by each runtime from its
+	 * environment.
+	 */
+	talkSilenceTimeoutMs?: number;
 }
 
 /** Per-connection metric batcher (Node aggregates + flushes to OTLP; a Worker may no-op). */

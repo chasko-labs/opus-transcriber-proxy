@@ -38,6 +38,7 @@ export function createNodeTranslationRuntime(): TranslationRuntime {
 			debug: config.debug,
 			translationUsageUrl: config.translation.usageUrl,
 			usageReportIntervalMs: parseIntOr(process.env.TRANSLATION_USAGE_REPORT_INTERVAL_MS, 15000),
+			talkSilenceTimeoutMs: parseIntOr(process.env.TRANSLATION_TALK_SILENCE_TIMEOUT_MS, 350),
 		},
 		writeMetric(metric) {
 			writeMetric(undefined, metric as any);

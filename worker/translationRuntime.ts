@@ -33,6 +33,7 @@ export function createWorkerTranslationRuntime(env: Env, request?: Request): Tra
 			debug: debugEnabled,
 			translationUsageUrl: env.TRANSLATION_USAGE_URL || '',
 			usageReportIntervalMs: parseIntOr(env.TRANSLATION_USAGE_REPORT_INTERVAL_MS, 15000),
+			talkSilenceTimeoutMs: parseIntOr(env.TRANSLATION_TALK_SILENCE_TIMEOUT_MS, 350),
 		},
 		writeMetric() {
 			// No OTLP in the Worker (yet); metrics are a no-op.
