@@ -15,7 +15,9 @@ import type { TranslationRuntime } from '../../src/translate/runtime';
 // RtpTimestamper defaults: 48000 Hz, 20 ms frames -> 960 ticks/frame, first frame at timestamp 0. Derived from the
 // same exported constants the production code uses so it can't drift if the frame duration ever changes.
 const SAMPLES_PER_FRAME = (RTP_CLOCK_RATE * FRAME_DURATION_MS) / 1000;
-// End-of-talk silence timeout used by the harness (> the RtpTimestamper 100 ms gap threshold).
+// End-of-talk silence timeout used by the harness (> the RtpTimestamper 100 ms gap threshold). Intentionally a round
+// 300 rather than the 350 production default: these tests exercise the timer mechanism, not the specific value, and
+// drive the fake clock relative to this constant, so any value above the gap threshold works.
 const TALK_TIMEOUT_MS = 300;
 // RTP ticks per ms (48 at 48 kHz); the stop's duration is the [start, stop) span converted with this.
 const TICKS_PER_MS = RTP_CLOCK_RATE / 1000;

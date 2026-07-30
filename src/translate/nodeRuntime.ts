@@ -28,7 +28,18 @@ provideBase64(
 	},
 );
 
+// Warn at most once per process if talk-end detection is disabled (see below).
+let warnedTalkTimeoutDisabled = false;
+
 export function createNodeTranslationRuntime(): TranslationRuntime {
+	const talkSilenceTimeoutMs = parseIntOr(process.env.TRANSLATION_TALK_SILENCE_TIMEOUT_MS, 350);
+	if (talkSilenceTimeoutMs <= 0 && !warnedTalkTimeoutDisabled) {
+		warnedTalkTimeoutDisabled = true;
+		logger.warn(
+			'TRANSLATION_TALK_SILENCE_TIMEOUT_MS <= 0 disables talk-end detection; on the /v1/realtime/translations ' +
+				'endpoint (no boundary event) translated sources will never report sending=false until the connection closes.',
+		);
+	}
 	return {
 		logger,
 		config: {
@@ -38,7 +49,7 @@ export function createNodeTranslationRuntime(): TranslationRuntime {
 			debug: config.debug,
 			translationUsageUrl: config.translation.usageUrl,
 			usageReportIntervalMs: parseIntOr(process.env.TRANSLATION_USAGE_REPORT_INTERVAL_MS, 15000),
-			talkSilenceTimeoutMs: parseIntOr(process.env.TRANSLATION_TALK_SILENCE_TIMEOUT_MS, 350),
+			talkSilenceTimeoutMs,
 		},
 		writeMetric(metric) {
 			writeMetric(undefined, metric as any);
