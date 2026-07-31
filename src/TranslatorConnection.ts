@@ -759,6 +759,7 @@ export class TranslatorConnection {
 		}
 		const transcript = this.transcriptBuffer;
 		this.transcriptBuffer = '';
+		this.log(`[${this.options.targetLanguage}] transcript final: ${transcript}`);
 		this.onTranscription?.(transcript, this.options.targetLanguage, /* isInterim */ false);
 	}
 
