@@ -77,6 +77,7 @@ async function flushMicrotasks(): Promise<void> {
 }
 
 const audioDelta = () => JSON.stringify({ type: 'response.output_audio.delta', delta: 'AAAA' });
+const audioDone = () => JSON.stringify({ type: 'session.output_audio.done' });
 const transcriptDelta = (text: string) => JSON.stringify({ type: 'session.output_transcript.delta', delta: text });
 const transcriptDone = (text: string) => JSON.stringify({ type: 'session.output_transcript.done', transcript: text });
 
@@ -156,6 +157,21 @@ describe('TranslatorConnection transcript finalization', () => {
 
 		// The silence timer must not emit a second (duplicate) final.
 		await advancePastSilence();
+		expect(transcripts.filter(([, isInterim]) => !isInterim)).toEqual([['hi there', false]]);
+	});
+
+	it('does not double-finalize when audio-done precedes transcript-done for the same response', async () => {
+		const { ws, transcripts } = await connect();
+
+		ws.fireMessage(audioDelta());
+		ws.fireMessage(transcriptDelta('hi there'));
+		// Real OpenAI ordering for one response on the general /v1/realtime endpoint: the audio content-part
+		// done event fires before the transcript content-part done event for that same response. endTalk()
+		// (triggered here by the audio-done handler) must not race the still-pending transcript-done and flush
+		// the buffer early — the authoritative done event below is the only final.
+		ws.fireMessage(audioDone());
+		ws.fireMessage(transcriptDone('hi there'));
+
 		expect(transcripts.filter(([, isInterim]) => !isInterim)).toEqual([['hi there', false]]);
 	});
 
