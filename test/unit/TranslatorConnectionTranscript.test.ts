@@ -1,9 +1,10 @@
 /**
  * Transcript-finalization tests for TranslatorConnection. The /v1/realtime/translations endpoint emits
- * session.output_transcript.delta but NO session.output_transcript.done, so the final transcript is emitted at the
- * same silence boundary as the audio talk-stop (finalizePendingTranscript, driven by the silence timer) — re-emitting
- * the last interim with isInterim=false. On the general /v1/realtime endpoint the transcript-done event still emits
- * the authoritative final and suppresses the boundary-driven one. Fake timers make the silence timer deterministic.
+ * session.output_transcript.delta (incremental fragments, append-only) but NO session.output_transcript.done, so the
+ * fragments are accumulated and the final transcript is the concatenation of the whole run, emitted with
+ * isInterim=false at the same silence boundary as the audio talk-stop (finalizePendingTranscript, driven by the
+ * silence timer). On the general /v1/realtime endpoint the transcript-done event still emits the authoritative final
+ * and suppresses the boundary-driven one. Fake timers make the silence timer deterministic.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
