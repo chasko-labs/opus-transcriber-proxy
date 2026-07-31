@@ -33,7 +33,12 @@ needs no API key, so it's the only provider that runs unconditionally.
 
 The three real providers assert `--assert-min-finals=1` on `/transcribe`. `/translate` (OpenAI only)
 asserts `--assert-min-media=1` (translated Opus audio came back) — transcript output from
-`/translate` is not gated on, since `TRANSLATE_TRANSCRIPTS` can legitimately be turned off.
+`/translate` is deliberately **not** gated on. Two reasons: `TRANSLATE_TRANSCRIPTS` can legitimately
+be off, and the transcript final is timing-flaky under this harness — the replay runs at full speed
+and closes promptly, but on `/v1/realtime/translations` the transcript output trails the audio, so
+the connection can close before any transcript delta arrives (0 finals). Do not re-add
+`--assert-min-finals` to the `translate` cells; transcript-final correctness is verified out-of-band
+by a real-time live run instead.
 
 ## Full cell list (11)
 

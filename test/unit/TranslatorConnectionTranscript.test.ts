@@ -121,6 +121,28 @@ describe('TranslatorConnection transcript finalization', () => {
 		]);
 	});
 
+	it('resets the transcript buffer between sequential talks (no contamination)', async () => {
+		const { ws, transcripts } = await connect();
+
+		// Talk 1: accumulate + finalize at silence.
+		ws.fireMessage(audioDelta());
+		ws.fireMessage(transcriptDelta('hola'));
+		ws.fireMessage(transcriptDelta(' mundo'));
+		await advancePastSilence();
+
+		// Talk 2: a fresh utterance after the first finalized (finalize clears the buffer).
+		ws.fireMessage(audioDelta());
+		ws.fireMessage(transcriptDelta('buenos'));
+		ws.fireMessage(transcriptDelta(' días'));
+		await advancePastSilence();
+
+		// Each final holds only its own utterance — no leftover 'hola mundo' bleeding into the second.
+		expect(transcripts.filter(([, isInterim]) => !isInterim)).toEqual([
+			['hola mundo', false],
+			['buenos días', false],
+		]);
+	});
+
 	it('does not double-finalize when a transcript-done event is present (general endpoint)', async () => {
 		const { ws, transcripts } = await connect();
 
