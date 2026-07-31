@@ -738,7 +738,10 @@ export class TranslatorConnection {
 		// streams output-audio deltas with no per-utterance boundary. Talk-stop there is driven by the silence
 		// timer (armTalkSilenceTimer), not this branch. This branch only fires against the general /v1/realtime
 		// endpoint; endTalk() is kept here as a defensive early-stop for that case (the timer would otherwise stop
-		// the talk shortly after anyway).
+		// the talk shortly after anyway). Deliberately does NOT finalize the transcript: on that endpoint the audio
+		// content-part done fires before the transcript content-part done for the same response, so flushing the
+		// buffer here would race the still-pending authoritative transcript-done handler below and double-emit a
+		// final. The transcript is left buffered for that handler (or, failing that, the silence timer / close).
 		if (
 			parsedMessage.type === 'session.output_audio.done'
 			|| parsedMessage.type === 'response.output_audio.done'
@@ -821,7 +824,13 @@ export class TranslatorConnection {
 			clearTimeout(this.talkTimeout);
 		}
 		this.talkDeadline = deadline;
-		this.talkTimeout = setTimeout(() => this.endTalk(), playoutAheadMs + this.talkSilenceTimeoutMs);
+		// Finalize the transcript here (silence fired -> nothing else will supply an authoritative done event),
+		// then end the talk. Order matters: endTalk() alone must NOT flush the transcript (see finalizePendingTranscript's
+		// docstring) — only this timer and doClose() are safe callers.
+		this.talkTimeout = setTimeout(() => {
+			this.finalizePendingTranscript();
+			this.endTalk();
+		}, playoutAheadMs + this.talkSilenceTimeoutMs);
 		// Don't keep the process alive solely for this timer (Node's Timeout has unref; the Worker's id doesn't).
 		(this.talkTimeout as unknown as { unref?: () => void }).unref?.();
 	}
@@ -833,6 +842,13 @@ export class TranslatorConnection {
 	 * fragment deltas with isInterim=false. On the general /v1/realtime endpoint the transcript-done handler emits
 	 * the authoritative final and clears the buffer first, so this is a no-op there. (Buffer only grows when
 	 * emitTranscripts is on.)
+	 *
+	 * Deliberately NOT called from endTalk() itself: on the general /v1/realtime endpoint the audio content-part
+	 * done event fires before the transcript content-part done event for the same response, and endTalk() also
+	 * runs from that audio-done handler (as a defensive early-stop, see handleOpenAIMessage) — flushing here on
+	 * every endTalk() call would race the still-pending authoritative done event and double-emit a final. Only
+	 * the silence timer (nothing else will ever supply a done event) and doClose() (final flush at teardown) call
+	 * this directly.
 	 */
 	private finalizePendingTranscript(): void {
 		if (this.transcriptBuffer === '') {
@@ -843,16 +859,17 @@ export class TranslatorConnection {
 		this.onTranscription?.(transcript, this.options.targetLanguage, /* isInterim */ false);
 	}
 
-	/** Emit the talk-stop boundary if a talk is in progress. Idempotent (a no-op when no talk is active). */
+	/**
+	 * Emit the talk-stop boundary if a talk is in progress. Idempotent (a no-op when no talk is active). Does NOT
+	 * finalize the pending transcript (see finalizePendingTranscript's docstring) — callers that need the
+	 * transcript flushed too (the silence timer, doClose()) call finalizePendingTranscript() themselves.
+	 */
 	private endTalk(): void {
 		if (this.talkTimeout !== undefined) {
 			clearTimeout(this.talkTimeout);
 			this.talkTimeout = undefined;
 			this.talkDeadline = 0; // keep the invariant obvious: no pending timer ⇒ no live deadline
 		}
-		// Finalize the transcript at the same boundary (before the talkActive guard, so a pending interim is still
-		// flushed at close even if no audio talk is active).
-		this.finalizePendingTranscript();
 		if (!this.talkActive) {
 			return;
 		}
@@ -908,8 +925,10 @@ export class TranslatorConnection {
 		}
 		this.reportUsageDelta();
 
-		// Close any talk still in progress so a receiver isn't left believing the source is still sending after the
-		// connection goes away. Fired while onTalkStop is still attached, before the detach below.
+		// Flush any pending transcript fragments and close any talk still in progress, so a receiver isn't left
+		// believing the source is still sending (or a trailing utterance unfinalized) after the connection goes
+		// away. Fired while onTranscription/onTalkStop are still attached, before the detach below.
+		this.finalizePendingTranscript();
 		this.endTalk();
 
 		// Detach callbacks before teardown so a late OpenAI event firing during close() can't re-emit on the
