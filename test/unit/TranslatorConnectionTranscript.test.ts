@@ -3,8 +3,7 @@
  * session.output_transcript.delta (incremental fragments, append-only) but NO session.output_transcript.done, so the
  * fragments are accumulated and the final transcript is the concatenation of the whole run, emitted with
  * isInterim=false at the same silence boundary as the audio talk-stop (finalizePendingTranscript, driven by the
- * silence timer). On the general /v1/realtime endpoint the transcript-done event still emits the authoritative final
- * and suppresses the boundary-driven one. Fake timers make the silence timer deterministic.
+ * silence timer). Fake timers make the silence timer deterministic.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -76,9 +75,8 @@ async function flushMicrotasks(): Promise<void> {
 	for (let i = 0; i < 20; i++) await Promise.resolve();
 }
 
-const audioDelta = () => JSON.stringify({ type: 'response.output_audio.delta', delta: 'AAAA' });
+const audioDelta = () => JSON.stringify({ type: 'session.output_audio.delta', delta: 'AAAA' });
 const transcriptDelta = (text: string) => JSON.stringify({ type: 'session.output_transcript.delta', delta: text });
-const transcriptDone = (text: string) => JSON.stringify({ type: 'session.output_transcript.done', transcript: text });
 
 describe('TranslatorConnection transcript finalization', () => {
 	beforeEach(() => vi.useFakeTimers());
@@ -141,22 +139,6 @@ describe('TranslatorConnection transcript finalization', () => {
 			['hola mundo', false],
 			['buenos días', false],
 		]);
-	});
-
-	it('does not double-finalize when a transcript-done event is present (general endpoint)', async () => {
-		const { ws, transcripts } = await connect();
-
-		ws.fireMessage(audioDelta());
-		ws.fireMessage(transcriptDelta('hi'));
-		ws.fireMessage(transcriptDone('hi there')); // authoritative final; clears the pending interim
-		expect(transcripts).toEqual([
-			['hi', true],
-			['hi there', false],
-		]);
-
-		// The silence timer must not emit a second (duplicate) final.
-		await advancePastSilence();
-		expect(transcripts.filter(([, isInterim]) => !isInterim)).toEqual([['hi there', false]]);
 	});
 
 	it('finalizes a pending transcript when the connection closes', async () => {

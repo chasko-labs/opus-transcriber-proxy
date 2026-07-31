@@ -196,8 +196,8 @@ export class TranslatorConnection {
 	//
 	// firstInputAt / lastInputAppendAt update only on PCM chunks with RMS
 	// above SPEECH_RMS_THRESHOLD — silence-padding chunks are ignored.
-	// All reset to null on session.output_audio.done so each response window
-	// is measured independently.
+	// The translations endpoint has no per-response boundary event, so this
+	// window is measured once per connection (TTFA of the first output).
 	private firstInputAt: number | null = null;
 	private lastInputAppendAt: number | null = null;
 	private firstOutputAt: number | null = null;
@@ -608,35 +608,8 @@ export class TranslatorConnection {
 			return;
 		}
 
-		// Note: the response.output_audio_transcript.delta/done events are intentionally NOT listed here — they
-		// are real transcript events for the general /v1/realtime endpoint and are handled below (the early
-		// return for minimalLogEvents would otherwise make those handlers dead code).
-		const minimalLogEvents = [
-			'response.audio_transcript.delta',
-			'input_audio_buffer.speech_started',
-			'input_audio_buffer.speech_stopped',
-			'conversation.item.added',
-			'response.content_part.done',
-			'input_audio_buffer.committed',
-			'response.created',
-			'response.output_item.added',
-			'response.content_part.added',
-			'response.output_item.done',
-			'conversation.item.done',
-		];
-
-		if (minimalLogEvents.includes(parsedMessage.type)) {
-			this.log(`[${this.options.targetLanguage}] Received event: ${parsedMessage.type}`);
-			return;
-		}
-
-		// The /v1/realtime/translations endpoint emits "session.output_*"
-		// event names; the general /v1/realtime endpoint emits "response.output_*".
-		// Accept both so this class works against either endpoint.
-		if (
-			parsedMessage.type === 'response.output_audio.delta'
-			|| parsedMessage.type === 'session.output_audio.delta'
-		) {
+		// Translated audio: base64-encoded PCM16 at 24 kHz, re-encoded to Opus and forwarded as RTP.
+		if (parsedMessage.type === 'session.output_audio.delta') {
 			const delta = parsedMessage.delta;
 			if (delta) {
 				// Latency: capture both TTFA and ongoing-lag on the first
@@ -678,10 +651,7 @@ export class TranslatorConnection {
 		}
 
 		// Transcript stream (text accompaniment of the translated audio).
-		if (
-			parsedMessage.type === 'session.output_transcript.delta'
-			|| parsedMessage.type === 'response.output_audio_transcript.delta'
-		) {
+		if (parsedMessage.type === 'session.output_transcript.delta') {
 			// Deltas are incremental fragments (append-only), not a cumulative hypothesis. Forward each as an
 			// interim (server.ts gates on `sendBack`/`sendBackInterim`) and concatenate into the run buffer so the
 			// whole utterance can be emitted as the final at the talk-stop boundary (the translations endpoint sends
@@ -699,58 +669,9 @@ export class TranslatorConnection {
 			return;
 		}
 
-		// Final transcript from an explicit transcript-done event. The /v1/realtime/translations endpoint does NOT
-		// send this (it emits only session.output_transcript.delta), so on that endpoint the final is emitted
-		// instead by finalizePendingTranscript() at the talk-stop silence boundary. This branch is the general
-		// /v1/realtime path, where the done event carries the authoritative full utterance.
-		if (
-			parsedMessage.type === 'session.output_transcript.done'
-			|| parsedMessage.type === 'response.output_audio_transcript.done'
-		) {
-			const transcript =
-				parsedMessage.transcript
-				|| parsedMessage.response?.output?.[0]?.content?.[0]?.transcript
-				|| parsedMessage.output?.[0]?.content?.[0]?.transcript;
-			if (typeof transcript === 'string' && transcript) {
-				this.log(`[${this.options.targetLanguage}] ${parsedMessage.type}: ${transcript}`);
-				if (this.runtime.config.emitTranscripts) {
-					// The transcript-done event is the authoritative full utterance → final. Discard the accumulated
-					// buffer so finalizePendingTranscript() doesn't re-emit a duplicate final at talk-stop.
-					this.onTranscription?.(transcript, this.options.targetLanguage, /* isInterim */ false);
-					this.transcriptBuffer = '';
-				}
-			} else if (this.runtime.config.emitTranscripts) {
-				// A transcript-done event with no extractable text usually means OpenAI changed the response
-				// schema (the fallback accessors no longer match) — warn so the mismatch is visible in prod.
-				this.runtime.logger.warn(`[${this.connectionId}] [${this.options.targetLanguage}] ${parsedMessage.type} carried no extractable transcript`);
-			} else {
-				this.log(`[${this.options.targetLanguage}] ${parsedMessage.type}`);
-			}
-			return;
-		}
-
-		// End-of-utterance markers (audio-stream end / response complete). Reset the per-response latency
-		// window so the next response is measured from its own input. The RTP timeline is NOT reset here —
-		// RtpTimestamper keeps one continuous, monotonic timeline across responses and inserts the real
-		// silence gap on the next frame. These events do not carry the transcript (emitted above).
-		//
-		// NOTE: the /v1/realtime/translations endpoint this class connects to does NOT emit these events — it
-		// streams output-audio deltas with no per-utterance boundary. Talk-stop there is driven by the silence
-		// timer (armTalkSilenceTimer), not this branch. This branch only fires against the general /v1/realtime
-		// endpoint; endTalk() is kept here as a defensive early-stop for that case (the timer would otherwise stop
-		// the talk shortly after anyway).
-		if (
-			parsedMessage.type === 'session.output_audio.done'
-			|| parsedMessage.type === 'response.output_audio.done'
-			|| parsedMessage.type === 'response.done'
-		) {
-			this.firstOutputAt = null;
-			this.firstInputAt = null;
-			this.lastInputAppendAt = null;
-			this.endTalk();
-			this.log(`[${this.options.targetLanguage}] ${parsedMessage.type}`);
-			return;
-		}
+		// The /v1/realtime/translations endpoint carries no transcript-done event and no per-utterance boundary
+		// event (audio-done / response.done): it streams deltas continuously, so the transcript final and the
+		// talk-stop are both driven by the silence timer (see finalizePendingTranscript / armTalkSilenceTimer).
 
 		this.log(`[${this.options.targetLanguage}] Received event: ${parsedMessage.type}`);
 
@@ -830,9 +751,7 @@ export class TranslatorConnection {
 	 * Emit the accumulated transcript for the run as the final, if any fragments are buffered, and reset the buffer.
 	 * The /v1/realtime/translations endpoint sends no transcript-done event, so — like the audio talk-stop — the
 	 * transcript is finalized at the silence boundary (and at close), emitting the concatenation of the run's
-	 * fragment deltas with isInterim=false. On the general /v1/realtime endpoint the transcript-done handler emits
-	 * the authoritative final and clears the buffer first, so this is a no-op there. (Buffer only grows when
-	 * emitTranscripts is on.)
+	 * fragment deltas with isInterim=false. (Buffer only grows when emitTranscripts is on.)
 	 */
 	private finalizePendingTranscript(): void {
 		if (this.transcriptBuffer === '') {
