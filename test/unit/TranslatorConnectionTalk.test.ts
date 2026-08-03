@@ -89,8 +89,7 @@ async function flushMicrotasks(): Promise<void> {
 	for (let i = 0; i < 20; i++) await Promise.resolve();
 }
 
-const audioDelta = () => JSON.stringify({ type: 'response.output_audio.delta', delta: 'AAAA' });
-const responseDone = () => JSON.stringify({ type: 'response.done' });
+const audioDelta = () => JSON.stringify({ type: 'session.output_audio.delta', delta: 'AAAA' });
 
 describe('TranslatorConnection talk boundaries', () => {
 	beforeEach(() => vi.useFakeTimers());
@@ -209,22 +208,6 @@ describe('TranslatorConnection talk boundaries', () => {
 		expect(mediaInfo.duration).toBe(Math.round(stopTs / TICKS_PER_MS));
 		expect(stopTs).toBeGreaterThan(2 * SAMPLES_PER_FRAME);
 		expect(mediaInfo.duration).toBeGreaterThan(40);
-	});
-
-	it('a done event ends the talk early (defensive path for the general /v1/realtime endpoint)', async () => {
-		const { ws, starts, stops } = await connect();
-
-		ws.fireMessage(audioDelta()); // talk start at ts 0
-		ws.fireMessage(audioDelta()); // second frame at ts 960
-		// The translations endpoint never sends this, but if pointed at the general endpoint a response.done ends
-		// the talk immediately (rather than waiting for the silence timer), and cancels the pending timer.
-		ws.fireMessage(responseDone());
-		expect(stops).toEqual([['55555555-a0', 2 * SAMPLES_PER_FRAME, { bytesSent: 6, duration: 40 }]]);
-
-		// The silence timer must not then fire a second stop.
-		await advancePastSilence();
-		expect(stops).toHaveLength(1);
-		expect(starts).toHaveLength(1);
 	});
 
 	it('does not emit a stop when there is no output audio', async () => {

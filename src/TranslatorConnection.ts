@@ -169,8 +169,17 @@ export class TranslatorConnection {
 	private lastFrameTimestamp = 0;
 	private talkStartTimestamp = 0;
 	private talkBytes = 0;
-	// Debounce timer that ends the talk after talkSilenceTimeoutMs of no output audio (re-armed on each frame).
+	// Accumulated transcript for the current run. The /v1/realtime/translations endpoint streams
+	// session.output_transcript.delta events that are INCREMENTAL FRAGMENTS (append-only, e.g. " sin", "color",
+	// "periód", "ica") — NOT a cumulative hypothesis — and it sends no transcript-done event. So the fragments are
+	// concatenated here and the whole run is emitted as the final at the talk-stop boundary (finalizePendingTranscript),
+	// then reset. Empty when nothing is pending. See the transcript handling in handleOpenAIMessage.
+	private transcriptBuffer = '';
+	// Debounce timer that ends the talk once BOTH output audio and (when enabled) the transcript have gone quiet
+	// for talkSilenceTimeoutMs; re-armed on each audio frame and each transcript delta. talkDeadline is its absolute
+	// wall-clock target, used to avoid a zero-playout transcript delta shortening a timer set from buffered audio.
 	private talkTimeout?: ReturnType<typeof setTimeout>;
+	private talkDeadline = 0;
 	// End-of-talk silence timeout in ms; 0 disables inference (only a done event / close ends a talk). Set in the ctor.
 	private readonly talkSilenceTimeoutMs: number;
 
@@ -187,8 +196,8 @@ export class TranslatorConnection {
 	//
 	// firstInputAt / lastInputAppendAt update only on PCM chunks with RMS
 	// above SPEECH_RMS_THRESHOLD — silence-padding chunks are ignored.
-	// All reset to null on session.output_audio.done so each response window
-	// is measured independently.
+	// The translations endpoint has no per-response boundary event, so this
+	// window is measured once per connection (TTFA of the first output).
 	private firstInputAt: number | null = null;
 	private lastInputAppendAt: number | null = null;
 	private firstOutputAt: number | null = null;
@@ -599,35 +608,8 @@ export class TranslatorConnection {
 			return;
 		}
 
-		// Note: the response.output_audio_transcript.delta/done events are intentionally NOT listed here — they
-		// are real transcript events for the general /v1/realtime endpoint and are handled below (the early
-		// return for minimalLogEvents would otherwise make those handlers dead code).
-		const minimalLogEvents = [
-			'response.audio_transcript.delta',
-			'input_audio_buffer.speech_started',
-			'input_audio_buffer.speech_stopped',
-			'conversation.item.added',
-			'response.content_part.done',
-			'input_audio_buffer.committed',
-			'response.created',
-			'response.output_item.added',
-			'response.content_part.added',
-			'response.output_item.done',
-			'conversation.item.done',
-		];
-
-		if (minimalLogEvents.includes(parsedMessage.type)) {
-			this.log(`[${this.options.targetLanguage}] Received event: ${parsedMessage.type}`);
-			return;
-		}
-
-		// The /v1/realtime/translations endpoint emits "session.output_*"
-		// event names; the general /v1/realtime endpoint emits "response.output_*".
-		// Accept both so this class works against either endpoint.
-		if (
-			parsedMessage.type === 'response.output_audio.delta'
-			|| parsedMessage.type === 'session.output_audio.delta'
-		) {
+		// Translated audio: base64-encoded PCM16 at 24 kHz, re-encoded to Opus and forwarded as RTP.
+		if (parsedMessage.type === 'session.output_audio.delta') {
 			const delta = parsedMessage.delta;
 			if (delta) {
 				// Latency: capture both TTFA and ongoing-lag on the first
@@ -669,67 +651,27 @@ export class TranslatorConnection {
 		}
 
 		// Transcript stream (text accompaniment of the translated audio).
-		if (
-			parsedMessage.type === 'session.output_transcript.delta'
-			|| parsedMessage.type === 'response.output_audio_transcript.delta'
-		) {
-			// Deltas are the growing hypothesis → interim. The consumer (server.ts) gates on
-			// `sendBack`/`sendBackInterim` and forwards to the client. Suppressed when transcripts disabled.
+		if (parsedMessage.type === 'session.output_transcript.delta') {
+			// Deltas are incremental fragments (append-only), not a cumulative hypothesis. Forward each as an
+			// interim (server.ts gates on `sendBack`/`sendBackInterim`) and concatenate into the run buffer so the
+			// whole utterance can be emitted as the final at the talk-stop boundary (the translations endpoint sends
+			// no transcript-done event; see finalizePendingTranscript). Suppressed when transcripts disabled.
 			if (this.runtime.config.emitTranscripts && typeof parsedMessage.delta === 'string' && parsedMessage.delta) {
 				this.onTranscription?.(parsedMessage.delta, this.options.targetLanguage, /* isInterim */ true);
+				this.transcriptBuffer += parsedMessage.delta;
+				// Extend the talk so it doesn't end (finalizing the transcript / emitting the audio stop) while the
+				// transcript is still streaming past the audio. playoutAhead is 0 — text has no playout. This also
+				// arms the timer when no audio talk is active (a transcript before the first audio frame, or a late
+				// fragment after a talk ended): the buffered transcript then finalizes on its own silence with no
+				// audio stop — preferable to attaching a stray trailing fragment to the next utterance's final.
+				this.armTalkSilenceTimer(0);
 			}
 			return;
 		}
 
-		// Final transcript. Emitted only from the transcript-done events so it fires once per utterance — the
-		// /v1/realtime/translations endpoint sends both session.output_transcript.done and response.done for the
-		// same utterance, and the audio-done events (below) carry no transcript.
-		if (
-			parsedMessage.type === 'session.output_transcript.done'
-			|| parsedMessage.type === 'response.output_audio_transcript.done'
-		) {
-			const transcript =
-				parsedMessage.transcript
-				|| parsedMessage.response?.output?.[0]?.content?.[0]?.transcript
-				|| parsedMessage.output?.[0]?.content?.[0]?.transcript;
-			if (typeof transcript === 'string' && transcript) {
-				this.log(`[${this.options.targetLanguage}] ${parsedMessage.type}: ${transcript}`);
-				if (this.runtime.config.emitTranscripts) {
-					// The transcript-done event is the authoritative full utterance → final.
-					this.onTranscription?.(transcript, this.options.targetLanguage, /* isInterim */ false);
-				}
-			} else if (this.runtime.config.emitTranscripts) {
-				// A transcript-done event with no extractable text usually means OpenAI changed the response
-				// schema (the fallback accessors no longer match) — warn so the mismatch is visible in prod.
-				this.runtime.logger.warn(`[${this.connectionId}] [${this.options.targetLanguage}] ${parsedMessage.type} carried no extractable transcript`);
-			} else {
-				this.log(`[${this.options.targetLanguage}] ${parsedMessage.type}`);
-			}
-			return;
-		}
-
-		// End-of-utterance markers (audio-stream end / response complete). Reset the per-response latency
-		// window so the next response is measured from its own input. The RTP timeline is NOT reset here —
-		// RtpTimestamper keeps one continuous, monotonic timeline across responses and inserts the real
-		// silence gap on the next frame. These events do not carry the transcript (emitted above).
-		//
-		// NOTE: the /v1/realtime/translations endpoint this class connects to does NOT emit these events — it
-		// streams output-audio deltas with no per-utterance boundary. Talk-stop there is driven by the silence
-		// timer (armTalkSilenceTimer), not this branch. This branch only fires against the general /v1/realtime
-		// endpoint; endTalk() is kept here as a defensive early-stop for that case (the timer would otherwise stop
-		// the talk shortly after anyway).
-		if (
-			parsedMessage.type === 'session.output_audio.done'
-			|| parsedMessage.type === 'response.output_audio.done'
-			|| parsedMessage.type === 'response.done'
-		) {
-			this.firstOutputAt = null;
-			this.firstInputAt = null;
-			this.lastInputAppendAt = null;
-			this.endTalk();
-			this.log(`[${this.options.targetLanguage}] ${parsedMessage.type}`);
-			return;
-		}
+		// The /v1/realtime/translations endpoint carries no transcript-done event and no per-utterance boundary
+		// event (audio-done / response.done): it streams deltas continuously, so the transcript final and the
+		// talk-stop are both driven by the silence timer (see finalizePendingTranscript / armTalkSilenceTimer).
 
 		this.log(`[${this.options.targetLanguage}] Received event: ${parsedMessage.type}`);
 
@@ -777,23 +719,48 @@ export class TranslatorConnection {
 	}
 
 	/**
-	 * (Re)arm the end-of-talk silence timer. The /v1/realtime/translations endpoint streams output-audio deltas with
-	 * no per-utterance boundary event, so a talk is ended when the output goes silent; the next frame starts a fresh
-	 * talk. Called on every emitted frame (debounce). The delay is measured from the projected MEDIA playout end
-	 * (`bufferAheadMs`, how long the already-emitted burst will still be playing) plus `talkSilenceTimeoutMs` of
-	 * silence beyond it — so a faster-than-real-time burst doesn't end the talk while the consumer is still playing
-	 * it out. A non-positive timeout disables inference (a talk then ends only on a done event, if any, or at close).
+	 * (Re)arm the end-of-talk silence timer. The /v1/realtime/translations endpoint streams output-audio and
+	 * output-transcript deltas with no per-utterance boundary event, so a talk is ended once BOTH have gone silent:
+	 * armed from each audio frame and (when transcripts are enabled) each transcript delta, so the audio sending-change
+	 * and the transcript final stay aligned to one boundary and a trailing transcript is not orphaned.
+	 *
+	 * `playoutAheadMs` is how far the projected MEDIA playout extends beyond now: `bufferAheadMs` for an audio frame
+	 * (so a faster-than-real-time burst isn't ended while the consumer is still playing it out), 0 for a transcript
+	 * delta (text has no playout). The deadline is `now + playoutAheadMs + talkSilenceTimeoutMs`. A pending timer is
+	 * only ever EXTENDED, never shortened — a zero-playout transcript delta must not cut a timer set from buffered
+	 * audio; the talk ends at the later of the two streams' quiet points. Non-positive timeout disables inference.
 	 */
-	private armTalkSilenceTimer(bufferAheadMs: number): void {
+	private armTalkSilenceTimer(playoutAheadMs: number): void {
+		if (this.talkSilenceTimeoutMs <= 0) {
+			return;
+		}
+		const deadline = Date.now() + playoutAheadMs + this.talkSilenceTimeoutMs;
+		if (this.talkTimeout !== undefined && deadline <= this.talkDeadline) {
+			return; // keep the later pending timer (don't let this source shorten it)
+		}
 		if (this.talkTimeout !== undefined) {
 			clearTimeout(this.talkTimeout);
-			this.talkTimeout = undefined;
 		}
-		if (this.talkSilenceTimeoutMs > 0) {
-			this.talkTimeout = setTimeout(() => this.endTalk(), bufferAheadMs + this.talkSilenceTimeoutMs);
-			// Don't keep the process alive solely for this timer (Node's Timeout has unref; the Worker's id doesn't).
-			(this.talkTimeout as unknown as { unref?: () => void }).unref?.();
+		this.talkDeadline = deadline;
+		this.talkTimeout = setTimeout(() => this.endTalk(), playoutAheadMs + this.talkSilenceTimeoutMs);
+		// Don't keep the process alive solely for this timer (Node's Timeout has unref; the Worker's id doesn't).
+		(this.talkTimeout as unknown as { unref?: () => void }).unref?.();
+	}
+
+	/**
+	 * Emit the accumulated transcript for the run as the final, if any fragments are buffered, and reset the buffer.
+	 * The /v1/realtime/translations endpoint sends no transcript-done event, so — like the audio talk-stop — the
+	 * transcript is finalized at the silence boundary (and at close), emitting the concatenation of the run's
+	 * fragment deltas with isInterim=false. (Buffer only grows when emitTranscripts is on.)
+	 */
+	private finalizePendingTranscript(): void {
+		if (this.transcriptBuffer === '') {
+			return;
 		}
+		const transcript = this.transcriptBuffer;
+		this.transcriptBuffer = '';
+		this.log(`[${this.options.targetLanguage}] transcript final: ${transcript}`);
+		this.onTranscription?.(transcript, this.options.targetLanguage, /* isInterim */ false);
 	}
 
 	/** Emit the talk-stop boundary if a talk is in progress. Idempotent (a no-op when no talk is active). */
@@ -801,7 +768,11 @@ export class TranslatorConnection {
 		if (this.talkTimeout !== undefined) {
 			clearTimeout(this.talkTimeout);
 			this.talkTimeout = undefined;
+			this.talkDeadline = 0; // keep the invariant obvious: no pending timer ⇒ no live deadline
 		}
+		// Finalize the transcript at the same boundary (before the talkActive guard, so a pending interim is still
+		// flushed at close even if no audio talk is active).
+		this.finalizePendingTranscript();
 		if (!this.talkActive) {
 			return;
 		}

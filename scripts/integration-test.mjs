@@ -34,9 +34,10 @@ const REPO_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const SAMPLE_DUMP = path.join(REPO_ROOT, 'resources', 'sample.jsonl');
 const CONTAINER_IMAGE = process.env.INTEGRATION_TEST_IMAGE || 'opus-transcriber-proxy';
 // worker/package.json pins the wrangler version this repo is tested against — prefer it over
-// whatever (if anything) is on PATH.
+// whatever (if anything) is on PATH. Otherwise fall back to `npx wrangler` rather than a bare `wrangler`:
+// a bare `wrangler` isn't on PATH after a local `npm install`, so spawning it directly ENOENTs.
 const LOCAL_WRANGLER = path.join(REPO_ROOT, 'worker', 'node_modules', '.bin', 'wrangler');
-const WRANGLER_BIN = existsSync(LOCAL_WRANGLER) ? LOCAL_WRANGLER : 'wrangler';
+const WRANGLER_ARGV = existsSync(LOCAL_WRANGLER) ? [LOCAL_WRANGLER] : ['npx', 'wrangler'];
 
 const PROVIDER_KEY_ENV = {
 	openai: 'OPENAI_API_KEY',
@@ -243,8 +244,8 @@ async function startWorker({ port, endpoint, provider, translateLang }) {
 	// --inspector-port=0: let the OS pick a free port for the devtools inspector instead of
 	// wrangler's fixed default (9229), which could collide with something else on the runner.
 	const wranglerArgs = ['dev', '--config', config, '--port', String(port), '--inspector-port', '0', '--env-file', envFile];
-	log(`${WRANGLER_BIN} ${wranglerArgs.join(' ')} (config=${config})`);
-	const proc = spawn(WRANGLER_BIN, wranglerArgs, { cwd: REPO_ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
+	log(`${WRANGLER_ARGV.join(' ')} ${wranglerArgs.join(' ')} (config=${config})`);
+	const proc = spawn(WRANGLER_ARGV[0], [...WRANGLER_ARGV.slice(1), ...wranglerArgs], { cwd: REPO_ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
 
 	async function stop() {
 		log('Stopping wrangler dev');
@@ -307,6 +308,11 @@ async function main() {
 			'--connect-timeout=15',
 		];
 		if (args.endpoint === 'translate') {
+			// Assert only that translated audio comes back. NOT --assert-min-finals: the transcript final depends on
+			// OpenAI's transcript latency vs this harness's full-speed replay + prompt close — the connection can
+			// (and in the container cells does) close before the trailing transcript arrives, so 0 finals is a
+			// timing artifact here, not a regression. A flaky gate is worse than none; transcript-final correctness
+			// is verified out-of-band by a real-time live run (a full-speed replay closes too soon to be reliable).
 			replayArgs.push(`--translate=${args.translateLang}`, '--assert-min-media=1');
 		} else if (args.provider !== 'dummy') {
 			// The dummy backend never emits transcripts (see src/backends/DummyBackend.ts) — its run
