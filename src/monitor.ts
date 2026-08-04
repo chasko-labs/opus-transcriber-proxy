@@ -16,11 +16,11 @@
 //                                Cloudflare Containers the worker only completes the WS upgrade
 //                                once the container is up, so a cold start (~30s) counts against
 //                                this — it must be large enough to cover one.
-//   MONITOR_RETRY_DELAY_SECONDS  wait before the single retry after a failed attempt (default 20);
-//                                a check is unhealthy only if both attempts fail. Both attempts of
-//                                a check reuse the SAME sessionId, so the retry lands on the
-//                                container the first attempt warmed rather than cold-starting a
-//                                second one.
+//   MONITOR_ATTEMPTS             attempts per check (default 3); a check is unhealthy only if all
+//                                of them fail. All attempts reuse the SAME sessionId, so retries
+//                                land on the container the first attempt warmed rather than
+//                                cold-starting a new one. Clamped to at least 1.
+//   MONITOR_RETRY_DELAY_SECONDS  wait before each retry after a failed attempt (default 20).
 //   MONITOR_SAMPLE               path to the JSONL Opus dump to replay (default resources/sample.jsonl)
 //   MONITOR_MIN_FINALS           minimum final transcripts required to pass (default 1)
 //   MONITOR_PORT / PORT          port for the metrics HTTP server (default 8080)
@@ -37,7 +37,10 @@ const MIN_FINALS = process.env.MONITOR_MIN_FINALS || '1';
 const SAMPLE = process.env.MONITOR_SAMPLE || 'resources/sample.jsonl';
 const URL_TEMPLATE = process.env.MONITOR_URL;
 const REPLAY_SCRIPT = 'scripts/replay-dump.cjs';
-const ATTEMPTS = 2;
+// Number of attempts per check; the check is unhealthy only if all of them fail. All attempts of a
+// check reuse the SAME sessionId, so retries land on the container the first attempt warmed rather
+// than cold-starting a new one. Clamped to at least 1.
+const ATTEMPTS = Math.max(1, parseInt(process.env.MONITOR_ATTEMPTS || '3', 10) || 3);
 
 if (!URL_TEMPLATE) {
 	console.error('monitor: MONITOR_URL is required');
@@ -137,10 +140,10 @@ async function runCheck(): Promise<void> {
 	log(`monitor: check starting (sessionId=${sessionId})`);
 
 	let result = await runAttempt(sessionId, 1);
-	if (!result.ok) {
+	for (let attempt = 2; !result.ok && attempt <= ATTEMPTS; attempt++) {
 		log(`monitor: retrying same session in ${RETRY_DELAY_MS / 1000}s`);
 		await sleep(RETRY_DELAY_MS);
-		result = await runAttempt(sessionId, 2);
+		result = await runAttempt(sessionId, attempt);
 	}
 
 	healthy = result.ok ? 1 : 0;
