@@ -16,11 +16,16 @@
 //                                Cloudflare Containers the worker only completes the WS upgrade
 //                                once the container is up, so a cold start (~30s) counts against
 //                                this — it must be large enough to cover one.
-//   MONITOR_RETRY_DELAY_SECONDS  wait before the single retry after a failed attempt (default 20);
-//                                a check is unhealthy only if both attempts fail. Both attempts of
-//                                a check reuse the SAME sessionId, so the retry lands on the
-//                                container the first attempt warmed rather than cold-starting a
-//                                second one.
+//   MONITOR_ATTEMPTS             attempts per check (default 3); a check is unhealthy only if all
+//                                of them fail. All attempts reuse the SAME sessionId, so retries
+//                                land on the container the first attempt warmed rather than
+//                                cold-starting a new one. Clamped to at least 1.
+//   MONITOR_RETRY_DELAY_SECONDS  wait before each retry after a failed attempt (default 20).
+//   MONITOR_DRAIN_SECONDS        after the sample finishes replaying, how long to keep the socket
+//                                open for trailing finals before giving up (default 10). This is an
+//                                upper bound: the attempt passes as soon as MONITOR_MIN_FINALS finals
+//                                arrive, so the full drain elapses only when they never do. Raising it
+//                                widens the tolerance for a slow provider finalization.
 //   MONITOR_SAMPLE               path to the JSONL Opus dump to replay (default resources/sample.jsonl)
 //   MONITOR_MIN_FINALS           minimum final transcripts required to pass (default 1)
 //   MONITOR_PORT / PORT          port for the metrics HTTP server (default 8080)
@@ -33,11 +38,15 @@ const PORT = parseInt(process.env.MONITOR_PORT || process.env.PORT || '8080', 10
 const INTERVAL_MS = parseInt(process.env.MONITOR_INTERVAL_SECONDS || '300', 10) * 1000;
 const RETRY_DELAY_MS = parseInt(process.env.MONITOR_RETRY_DELAY_SECONDS || '20', 10) * 1000;
 const CONNECT_TIMEOUT = process.env.MONITOR_CONNECT_TIMEOUT || '30';
+const DRAIN = process.env.MONITOR_DRAIN_SECONDS || '10';
 const MIN_FINALS = process.env.MONITOR_MIN_FINALS || '1';
 const SAMPLE = process.env.MONITOR_SAMPLE || 'resources/sample.jsonl';
 const URL_TEMPLATE = process.env.MONITOR_URL;
 const REPLAY_SCRIPT = 'scripts/replay-dump.cjs';
-const ATTEMPTS = 2;
+// Number of attempts per check; the check is unhealthy only if all of them fail. All attempts of a
+// check reuse the SAME sessionId, so retries land on the container the first attempt warmed rather
+// than cold-starting a new one. Clamped to at least 1.
+const ATTEMPTS = Math.max(1, parseInt(process.env.MONITOR_ATTEMPTS || '3', 10) || 3);
 
 if (!URL_TEMPLATE) {
 	console.error('monitor: MONITOR_URL is required');
@@ -87,7 +96,7 @@ interface AttemptResult {
 function runAttempt(sessionId: string, attemptNo: number): Promise<AttemptResult> {
 	return new Promise((resolve) => {
 		const url = (URL_TEMPLATE as string).replace('__SESSION_ID__', sessionId);
-		const args = [REPLAY_SCRIPT, SAMPLE, url, '0', '--ci', `--connect-timeout=${CONNECT_TIMEOUT}`, `--assert-min-finals=${MIN_FINALS}`];
+		const args = [REPLAY_SCRIPT, SAMPLE, url, '0', '--ci', `--connect-timeout=${CONNECT_TIMEOUT}`, `--drain=${DRAIN}`, `--assert-min-finals=${MIN_FINALS}`];
 		// Headers go to the replay via REPLAY_HEADERS (env), never on the command line, so
 		// credential-bearing values stay out of the process argument list.
 		const childEnv = { ...process.env };
@@ -137,10 +146,10 @@ async function runCheck(): Promise<void> {
 	log(`monitor: check starting (sessionId=${sessionId})`);
 
 	let result = await runAttempt(sessionId, 1);
-	if (!result.ok) {
+	for (let attempt = 2; !result.ok && attempt <= ATTEMPTS; attempt++) {
 		log(`monitor: retrying same session in ${RETRY_DELAY_MS / 1000}s`);
 		await sleep(RETRY_DELAY_MS);
-		result = await runAttempt(sessionId, 2);
+		result = await runAttempt(sessionId, attempt);
 	}
 
 	healthy = result.ok ? 1 : 0;

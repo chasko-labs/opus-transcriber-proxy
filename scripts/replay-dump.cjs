@@ -26,6 +26,10 @@
  *                    the script behaves exactly as before (always exits 0, no assertions).
  *   --connect-timeout=<sec> - (--ci only) fail if the WebSocket doesn't open within this many
  *                  seconds (default 15).
+ *   --drain=<sec>  - After the last frame is sent, keep the socket open up to this long for trailing
+ *                  finals before closing (default 10). In --ci mode this is only an upper bound: the
+ *                  socket closes as soon as every --assert-min-* threshold is met, so the full drain
+ *                  elapses only when the expected transcripts never arrive.
  *   --assert-min-finals=<N>   - (--ci only) fail unless at least N final transcripts were received.
  *   --assert-min-interims=<N> - (--ci only) fail unless at least N interim transcripts were received.
  *   --assert-min-media=<N>    - (--ci only) fail unless at least N translated media packets were received.
@@ -167,6 +171,7 @@ let translateLang = null; // when set, send `start-translation` signaling for th
 let saveAudioDir = null;  // when set, save returned translated audio as per-tag .opus files here
 let ciMode = false;
 let connectTimeoutSec = 15;
+let drainSec = 10; // seconds to keep the socket open after the last frame for trailing finals (the cap)
 let assertMinFinals = null;
 let assertMinInterims = null;
 let assertMinMedia = null;
@@ -187,6 +192,8 @@ for (let i = 0; i < extraArgs.length; i++) {
         ciMode = true;
     } else if (arg.startsWith('--connect-timeout=')) {
         connectTimeoutSec = parseFloat(arg.slice('--connect-timeout='.length));
+    } else if (arg.startsWith('--drain=')) {
+        drainSec = parseFloat(arg.slice('--drain='.length));
     } else if (arg.startsWith('--assert-min-finals=')) {
         assertMinFinals = parseInt(arg.slice('--assert-min-finals='.length), 10);
     } else if (arg.startsWith('--assert-min-interims=')) {
@@ -281,6 +288,33 @@ const ws = new WebSocket(wsUrl, wsOptions);
 
 let connected = false;
 let connectTimeoutHandle = null;
+
+// Early-success close (--ci): once every set --assert-min-* threshold is met there is nothing left
+// to prove, so close immediately and let the 'close' handler report PASS — instead of holding the
+// socket open for the full drain window. This removes the timing race where a trailing final arrives
+// just after a fixed-length drain closes the socket (the monitor's main false-negative source).
+// Gated on replayComplete so we never close mid-blast (a pending ws.send() on a closing socket would
+// throw and trip the 'error' handler's hard FAIL).
+let drainTimer = null;
+let replayComplete = false;
+let earlyClosed = false;
+const hasCiAsserts = assertMinFinals !== null || assertMinInterims !== null || assertMinMedia !== null;
+function ciAssertsSatisfied() {
+    if (assertMinFinals !== null && finalTranscripts < assertMinFinals) return false;
+    if (assertMinInterims !== null && interimTranscripts < assertMinInterims) return false;
+    if (assertMinMedia !== null && mediaPacketsReceived < assertMinMedia) return false;
+    return true;
+}
+function finishEarly() {
+    if (earlyClosed || !ciMode || !hasCiAsserts || !replayComplete) return;
+    if (!ciAssertsSatisfied()) return;
+    earlyClosed = true;
+    if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
+    process.stdout.write('\r' + ' '.repeat(120) + '\r');
+    console.log(`\nAssertions satisfied (${finalTranscripts} final(s)) — closing early instead of draining.`);
+    ws.close();
+}
+
 if (ciMode) {
     connectTimeoutHandle = setTimeout(() => {
         if (!connected) {
@@ -330,12 +364,16 @@ ws.on('open', () => {
     function sendNextMessage() {
         if (messageIndex >= messages.length) {
             isComplete = true;
+            replayComplete = true;
             clearInterval(statusInterval);
             process.stdout.write('\r' + ' '.repeat(120) + '\r'); // Clear status line
-            console.log('\nReplay complete! Draining trailing transcripts...');
-            // Keep the socket open briefly so trailing finals (emitted after the
-            // force-commit timeout once audio stops) are received before closing.
-            setTimeout(() => ws.close(), 5000);
+            console.log(`\nReplay complete! Draining trailing transcripts (up to ${drainSec}s)...`);
+            // Keep the socket open so trailing finals (emitted after the force-commit timeout once
+            // audio stops) are received before closing. This is now the upper bound: in --ci mode
+            // finishEarly() closes as soon as the asserts are met, so the full drain only elapses
+            // when the expected transcripts never arrive (a genuine failure).
+            drainTimer = setTimeout(() => ws.close(), drainSec * 1000);
+            finishEarly(); // asserts may already be satisfied by the time the blast finishes
             return;
         }
 
@@ -377,6 +415,7 @@ ws.on('message', (data) => {
                 if (!packets) { packets = []; audioByTag.set(tag, packets); }
                 packets.push(Buffer.from(payload, 'base64'));
             }
+            finishEarly();
             return;
         }
 
@@ -392,6 +431,8 @@ ws.on('message', (data) => {
             // Clear status line, print transcript, redraw status
             process.stdout.write('\r' + ' '.repeat(120) + '\r');
             console.log(`[${participantId}]${lang}${marker} ${speakerPrefix}${text}`);
+
+            finishEarly();
         }
     } catch (error) {
         // Not JSON or different format, ignore
@@ -413,6 +454,7 @@ ws.on('error', (error) => {
 });
 
 ws.on('close', () => {
+    if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
     process.stdout.write('\r' + ' '.repeat(120) + '\r'); // Clear status line
     console.log(`Connection closed. Received ${mediaPacketsReceived} media packet(s), ${interimTranscripts} interim + ${finalTranscripts} final transcript(s).`);
 
