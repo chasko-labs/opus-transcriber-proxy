@@ -38,6 +38,9 @@ export function buildServerInfo(opts: { sessionId?: string; provider?: Provider 
 
 	if (opts.sessionId) info.sessionId = opts.sessionId;
 	if (instanceId) info.instanceId = instanceId;
+	// Docker image tag a Worker's WASM codec was sourced from (translate-worker deploy only; unset on the
+	// container, where code + codec are one image). Reported alongside `gitHash` so a code/WASM mismatch is visible.
+	if (process.env.SOURCE_IMAGE_TAG) info.sourceImageTag = process.env.SOURCE_IMAGE_TAG;
 
 	const city = process.env.CLOUDFLARE_LOCATION;
 	const country = process.env.CLOUDFLARE_COUNTRY_A2;

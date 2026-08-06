@@ -66,6 +66,9 @@ export interface Env {
 	TRANSLATION_TALK_SILENCE_TIMEOUT_MS?: string;
 	ENABLE_TRANSCRIBE?: string;
 	ENABLE_TRANSLATE?: string;
+	// Docker image tag the Worker's WASM Opus codec was sourced from at deploy (set by the translate
+	// deploy). Surfaced in the info message so a code/WASM version mismatch is visible to the peer.
+	SOURCE_IMAGE_TAG?: string;
 	ENABLE_OPENAI_CUSTOM_PROVIDER?: string;
 	OPENAI_CUSTOM_REQUIRE_WSS?: string;
 	USE_DISPATCHER?: string;
