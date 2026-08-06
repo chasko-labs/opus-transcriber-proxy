@@ -51,6 +51,10 @@ const WebSocket = require('ws');
 let mediaPacketsReceived = 0; // translated `media` (Opus) frames — the /translate audio return path
 let finalTranscripts = 0;
 let interimTranscripts = 0;
+// Talk-boundary events bracketing translated audio. Only start/stop that carry a `timestamp` are the
+// per-talk sending-change boundaries (a plain start/stop without one is a stream announcement).
+let talkStartEvents = 0;
+let talkStopEvents = 0;
 // tag -> array of Opus packets (Buffers) received for that synthetic source (for --save-audio).
 const audioByTag = new Map();
 
@@ -419,6 +423,18 @@ ws.on('message', (data) => {
             return;
         }
 
+        // Talk-boundary start/stop events bracketing translated audio: print each with its RTP timestamp
+        // so voice start vs stop is visible. Only the timestamped ones are per-talk sending-change
+        // boundaries (a plain start/stop without a timestamp is a stream announcement).
+        if (parsed.event === 'start' || parsed.event === 'stop') {
+            const ts = parsed[parsed.event]?.timestamp;
+            const tag = parsed[parsed.event]?.tag;
+            if (ts != null) { if (parsed.event === 'start') talkStartEvents++; else talkStopEvents++; }
+            process.stdout.write('\r' + ' '.repeat(120) + '\r');
+            console.log(`<talk ${parsed.event}> tag=${tag} timestamp=${ts ?? '(none)'}`);
+            return;
+        }
+
         // Check if this is a transcription result (transcription-result or realtime-translation-result)
         if (parsed.type === 'transcription-result' || parsed.type === 'realtime-translation-result' || parsed.event === 'transcription-result') {
             const text = parsed.transcript?.map(t => t.text).join(' ') || '';
@@ -456,7 +472,7 @@ ws.on('error', (error) => {
 ws.on('close', () => {
     if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
     process.stdout.write('\r' + ' '.repeat(120) + '\r'); // Clear status line
-    console.log(`Connection closed. Received ${mediaPacketsReceived} media packet(s), ${interimTranscripts} interim + ${finalTranscripts} final transcript(s).`);
+    console.log(`Connection closed. Received ${mediaPacketsReceived} media packet(s), ${interimTranscripts} interim + ${finalTranscripts} final transcript(s), ${talkStartEvents} talk-start + ${talkStopEvents} talk-stop event(s).`);
 
     if (saveAudioDir && audioByTag.size > 0) {
         fs.mkdirSync(saveAudioDir, { recursive: true });

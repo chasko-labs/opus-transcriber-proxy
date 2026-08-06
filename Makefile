@@ -157,6 +157,8 @@ define OPUS_ENCODER_EMCC_OPTS
   , '_opus_frame_encoder_destroy' \
   , '_opus_frame_encoder_set_bitrate' \
   , '_opus_frame_encoder_set_complexity' \
+  , '_opus_frame_encoder_set_dtx' \
+  , '_opus_frame_encoder_get_last_in_dtx' \
 ]" \
 -s EXPORTED_RUNTIME_METHODS="['wasmMemory', 'HEAPU8']" \
 -I "$(LIBOPUS_SRC)/include" \

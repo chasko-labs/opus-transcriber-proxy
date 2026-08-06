@@ -29,4 +29,12 @@ int opus_frame_encoder_set_bitrate(opus_encoder_context *ctx, int bitrate);
 EMSCRIPTEN_KEEPALIVE
 int opus_frame_encoder_set_complexity(opus_encoder_context *ctx, int complexity);
 
+EMSCRIPTEN_KEEPALIVE
+int opus_frame_encoder_set_dtx(opus_encoder_context *ctx, int enable);
+
+// Whether the most recently encoded frame was a DTX frame (OPUS_GET_IN_DTX). Only meaningful when
+// DTX has been enabled via opus_frame_encoder_set_dtx.
+EMSCRIPTEN_KEEPALIVE
+int opus_frame_encoder_get_last_in_dtx(opus_encoder_context *ctx);
+
 #endif // OPUS_FRAME_ENCODER_H

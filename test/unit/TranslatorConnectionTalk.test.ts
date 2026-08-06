@@ -46,6 +46,10 @@ function makeFakeWebSocket(): FakeWs {
 	};
 }
 
+// Whether the mock encoder reports its next frame as a DTX (silence) frame. Tests toggle it before
+// firing an audio delta to simulate libopus flagging voice vs. silence; reset in beforeEach.
+let mockInDtx = false;
+
 /** Runtime whose encoder emits exactly one 3-byte Opus frame per encodeFrame call. */
 function makeHarness(talkSilenceTimeoutMs = TALK_TIMEOUT_MS): { runtime: TranslationRuntime; sockets: FakeWs[] } {
 	const sockets: FakeWs[] = [];
@@ -76,7 +80,12 @@ function makeHarness(talkSilenceTimeoutMs = TALK_TIMEOUT_MS): { runtime: Transla
 				free: () => {},
 			}) as any,
 		createOpusEncoder: () =>
-			({ ready: Promise.resolve(), encodeFrame: () => [new Uint8Array([1, 2, 3])], reset: () => {}, free: () => {} }) as any,
+			({
+				ready: Promise.resolve(),
+				encodeFrame: () => [{ data: new Uint8Array([1, 2, 3]), inDtx: mockInDtx }],
+				reset: () => {},
+				free: () => {},
+			}) as any,
 		buildServerInfo: () => undefined,
 	};
 	return { runtime, sockets };
@@ -92,7 +101,10 @@ async function flushMicrotasks(): Promise<void> {
 const audioDelta = () => JSON.stringify({ type: 'session.output_audio.delta', delta: 'AAAA' });
 
 describe('TranslatorConnection talk boundaries', () => {
-	beforeEach(() => vi.useFakeTimers());
+	beforeEach(() => {
+		vi.useFakeTimers();
+		mockInDtx = false;
+	});
 	afterEach(() => {
 		vi.useRealTimers();
 		vi.restoreAllMocks();
@@ -133,6 +145,37 @@ describe('TranslatorConnection talk boundaries', () => {
 		// 2 frames of 3 bytes each -> bytesSent 6, duration 2 * 20 ms.
 		expect(stops).toEqual([['55555555-a0', 2 * SAMPLES_PER_FRAME, { bytesSent: 6, duration: 40 }]]);
 		expect(starts).toHaveLength(1);
+	});
+
+	it('drops DTX (silence) frames: not forwarded, do not extend the talk, and end it on sustained DTX', async () => {
+		const { conn, ws, starts, stops } = await connect();
+		const media: Array<[number, number]> = []; // [rtpSequenceNumber, timestamp]
+		conn.onAudioFrame = (_tag, seq, ts) => media.push([seq, ts]);
+
+		// Voice frames: talk starts and each is forwarded.
+		ws.fireMessage(audioDelta());
+		ws.fireMessage(audioDelta());
+		expect(starts).toEqual([['55555555-a0', 0]]);
+		expect(media).toHaveLength(2);
+
+		// libopus goes into DTX (silence). These frames must NOT be forwarded and must NOT extend the talk —
+		// this is what stops a live mic's continuous ambient output from holding the talk open forever.
+		mockInDtx = true;
+		ws.fireMessage(audioDelta());
+		ws.fireMessage(audioDelta());
+		expect(media).toHaveLength(2); // unchanged — silence dropped
+		expect(stops).toEqual([]); // silence timer not yet fired
+
+		// Sustained DTX past the timeout ends the talk, at the last VOICE frame's end (the DTX frames didn't
+		// advance the RTP timeline), so bytesSent/duration cover only the 2 voice frames.
+		await advancePastSilence();
+		expect(stops).toEqual([['55555555-a0', 2 * SAMPLES_PER_FRAME, { bytesSent: 6, duration: 40 }]]);
+
+		// Voice resumes -> a fresh talk starts and forwarding resumes.
+		mockInDtx = false;
+		ws.fireMessage(audioDelta());
+		expect(starts).toHaveLength(2);
+		expect(media).toHaveLength(3);
 	});
 
 	it('keeps the talk open until a faster-than-real-time burst would finish playing out', async () => {
