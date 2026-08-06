@@ -178,6 +178,34 @@ describe('TranslatorConnection talk boundaries', () => {
 		expect(media).toHaveLength(3);
 	});
 
+	it('preserves the real silence gap in the RTP timeline across dropped DTX frames', async () => {
+		const { conn, ws } = await connect();
+		const media: Array<[number, number]> = []; // [rtpSequenceNumber, timestamp]
+		conn.onAudioFrame = (_tag, seq, ts) => media.push([seq, ts]);
+
+		ws.fireMessage(audioDelta()); // one voice frame at the start of the timeline
+		expect(media).toHaveLength(1);
+		const firstTs = media[0][1];
+
+		// ~5 s of real time passes while the encoder is in DTX (mic on, but the translated output is
+		// comfort noise). The DTX frames are dropped, so nothing is forwarded.
+		mockInDtx = true;
+		ws.fireMessage(audioDelta()); // DTX -> dropped
+		await vi.advanceTimersByTimeAsync(5000);
+		expect(media).toHaveLength(1);
+
+		// Voice resumes. The RtpTimestamper is one continuous media-playout clock, so the resumed frame's
+		// timestamp jumps forward by ~the elapsed silence — NOT `firstTs + one frame`. That's what makes
+		// dropping DTX frames transparent: the client hears real silence for the gap, not a splice.
+		mockInDtx = false;
+		ws.fireMessage(audioDelta());
+		expect(media).toHaveLength(2);
+		const resumeTs = media[1][1];
+		// Contiguous forwarding would advance by exactly one frame; assert a multi-second jump (5 s of
+		// silence is ~250 frames, so > 100 frames' worth is a wide, robust bound).
+		expect(resumeTs - firstTs).toBeGreaterThan(100 * SAMPLES_PER_FRAME);
+	});
+
 	it('keeps the talk open until a faster-than-real-time burst would finish playing out', async () => {
 		const { ws, starts, stops } = await connect();
 
