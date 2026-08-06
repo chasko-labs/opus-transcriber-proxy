@@ -14,7 +14,13 @@ import type { IOpusEncoder, OpusEncoderConfig } from '../../src/OpusEncoder/opus
 
 const SAMPLE_RATE = 24000;
 const FRAME_SAMPLES = SAMPLE_RATE / 50; // 20 ms
-const nativeAddonExists = fs.existsSync(path.join(__dirname, '../../build/Release/opus_native.node'));
+// Only exercise a backend whose artifacts are actually built. CI's `test` job builds just the native
+// addon (the facade uses it there), not the WASM `dist/opus-*.cjs`, so the wasm case is skipped there;
+// locally (and anywhere `build:wasm` has run) both run. Mirrors OpusRoundTrip's native gating.
+const nativeBuilt = fs.existsSync(path.join(__dirname, '../../build/Release/opus_native.node'));
+const wasmBuilt =
+	fs.existsSync(path.join(__dirname, '../../dist/opus-encoder.cjs')) &&
+	fs.existsSync(path.join(__dirname, '../../dist/opus-decoder.cjs'));
 
 /** N frames of a 440 Hz tone (voice-like energy). */
 function tone(frames: number): Uint8Array {
@@ -46,7 +52,10 @@ async function makeEncoder(backend: 'wasm' | 'native', config: OpusEncoderConfig
 	return enc;
 }
 
-const backends: Array<'wasm' | 'native'> = nativeAddonExists ? ['wasm', 'native'] : ['wasm'];
+const backends: Array<'wasm' | 'native'> = [
+	...(wasmBuilt ? (['wasm'] as const) : []),
+	...(nativeBuilt ? (['native'] as const) : []),
+];
 
 describe.each(backends)('Opus DTX (%s backend)', (backend) => {
 	const base: OpusEncoderConfig = { sampleRate: SAMPLE_RATE, channels: 1, application: 'voip' };
