@@ -101,8 +101,11 @@ export class OpusEncoderWasm implements IOpusEncoder {
 		const complexityRet = this.module._opus_frame_encoder_set_complexity(this.ctx, this.config.complexity);
 		if (complexityRet < 0) console.warn(`OpusEncoder: set_complexity(${this.config.complexity}) failed (${complexityRet})`);
 		if (this.config.dtx) {
+			// Unlike bitrate/complexity (a warn is fine — codec keeps a sane default), a failed DTX enable is
+			// consequential: inDtx would never be true, every frame would be forwarded, and the voice-vs-silence
+			// detection the caller relies on silently regresses. Fail loudly instead, matching the native addon.
 			const dtxRet = this.module._opus_frame_encoder_set_dtx(this.ctx, 1);
-			if (dtxRet < 0) console.warn(`OpusEncoder: set_dtx(1) failed (${dtxRet})`);
+			if (dtxRet < 0) throw new Error(`OpusEncoder: set_dtx(1) failed (${dtxRet})`);
 		}
 
 		const maxPcmBytes = this.frameSize * this.config.channels * 2; // 16-bit samples

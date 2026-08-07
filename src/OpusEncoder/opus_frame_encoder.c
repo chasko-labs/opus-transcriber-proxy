@@ -76,6 +76,10 @@ int opus_frame_encode(
         } else {
             ctx->last_in_dtx = 0;
         }
+    } else {
+        // Encode failed: clear the flag so a stale value can't be read as a false DTX (the JS wrapper
+        // throws on a negative return before reading it, so this is belt-and-suspenders).
+        ctx->last_in_dtx = 0;
     }
 
     return encoded_bytes;
