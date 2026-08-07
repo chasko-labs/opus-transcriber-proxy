@@ -1,4 +1,4 @@
-import type { IOpusEncoder, OpusEncoderConfig } from './opusEncoderTypes';
+import type { EncodedFrame, IOpusEncoder, OpusEncoderConfig } from './opusEncoderTypes';
 
 // This file deliberately logs via `console` (not the Winston logger): it is part of the Worker-safe
 // core (see scripts/check-worker-safe.mjs), so it cannot import ../logger. On the Node container
@@ -33,6 +33,8 @@ interface OpusEncoderModule {
 	_opus_frame_encoder_destroy: (ctx: number) => void;
 	_opus_frame_encoder_set_bitrate: (ctx: number, bitrate: number) => number;
 	_opus_frame_encoder_set_complexity: (ctx: number, complexity: number) => number;
+	_opus_frame_encoder_set_dtx: (ctx: number, enable: number) => number;
+	_opus_frame_encoder_get_last_in_dtx: (ctx: number) => number;
 	_malloc: (size: number) => number;
 	_free: (ptr: number) => void;
 	HEAPU8: Uint8Array;
@@ -63,6 +65,7 @@ export class OpusEncoderWasm implements IOpusEncoder {
 			application: config.application || 'voip',
 			bitrate: config.bitrate || 64000,
 			complexity: config.complexity || 5,
+			dtx: config.dtx ?? false,
 		};
 
 		this.ready = this.init();
@@ -97,6 +100,13 @@ export class OpusEncoderWasm implements IOpusEncoder {
 		if (bitrateRet < 0) console.warn(`OpusEncoder: set_bitrate(${this.config.bitrate}) failed (${bitrateRet})`);
 		const complexityRet = this.module._opus_frame_encoder_set_complexity(this.ctx, this.config.complexity);
 		if (complexityRet < 0) console.warn(`OpusEncoder: set_complexity(${this.config.complexity}) failed (${complexityRet})`);
+		if (this.config.dtx) {
+			// Unlike bitrate/complexity (a warn is fine — codec keeps a sane default), a failed DTX enable is
+			// consequential: inDtx would never be true, every frame would be forwarded, and the voice-vs-silence
+			// detection the caller relies on silently regresses. Fail loudly instead, matching the native addon.
+			const dtxRet = this.module._opus_frame_encoder_set_dtx(this.ctx, 1);
+			if (dtxRet < 0) throw new Error(`OpusEncoder: set_dtx(1) failed (${dtxRet})`);
+		}
 
 		const maxPcmBytes = this.frameSize * this.config.channels * 2; // 16-bit samples
 		this.pcmBuffer = new Uint8Array(this.module.HEAPU8.buffer, this.module._malloc(maxPcmBytes), maxPcmBytes);
@@ -107,7 +117,7 @@ export class OpusEncoderWasm implements IOpusEncoder {
 		this.isReady = true;
 	}
 
-	encodeFrame(pcmData: Uint8Array): Uint8Array[] {
+	encodeFrame(pcmData: Uint8Array): EncodedFrame[] {
 		if (!this.isReady || !this.module || !this.pcmBuffer || !this.outputBuffer) {
 			throw new Error('Encoder not ready');
 		}
@@ -124,7 +134,7 @@ export class OpusEncoderWasm implements IOpusEncoder {
 		}
 
 		const frameSizeBytes = this.getFrameSizeBytes();
-		const encodedFrames: Uint8Array[] = [];
+		const encodedFrames: EncodedFrame[] = [];
 		let offset = 0;
 
 		while (input.length - offset >= frameSizeBytes) {
@@ -149,8 +159,10 @@ export class OpusEncoderWasm implements IOpusEncoder {
 				throw new Error(`Opus encoding failed: ${errorMsg}`);
 			}
 
-			// Must copy: outputBuffer is the reused WASM-heap view, overwritten on the next iteration/call.
-			encodedFrames.push(new Uint8Array(this.outputBuffer.subarray(0, encodedBytes)));
+			// Read the DTX flag for the frame just encoded (0 unless DTX is enabled). Must copy the output:
+			// outputBuffer is the reused WASM-heap view, overwritten on the next iteration/call.
+			const inDtx = this.module._opus_frame_encoder_get_last_in_dtx(this.ctx) !== 0;
+			encodedFrames.push({ data: new Uint8Array(this.outputBuffer.subarray(0, encodedBytes)), inDtx });
 
 			offset += frameSizeBytes;
 		}

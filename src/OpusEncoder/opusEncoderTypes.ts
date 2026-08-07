@@ -10,12 +10,27 @@ export interface OpusEncoderConfig {
 	application?: 'voip' | 'audio' | 'restricted_lowdelay';
 	bitrate?: number;
 	complexity?: number; // 0-10
+	/**
+	 * Enable Opus DTX (discontinuous transmission). With DTX on, libopus's own VAD flags
+	 * near-silence / comfort-noise frames as "in DTX" ([EncodedFrame.inDtx]), which callers use to
+	 * tell real voice from silence. Requires VBR (the codec default). Off by default.
+	 */
+	dtx?: boolean;
+}
+
+/**
+ * One encoded Opus frame plus whether libopus treated it as a DTX (discontinuous-transmission)
+ * frame. When [OpusEncoderConfig.dtx] is disabled, [inDtx] is always false.
+ */
+export interface EncodedFrame {
+	data: Uint8Array;
+	inDtx: boolean;
 }
 
 /** The surface both backends implement and the facade delegates to. */
 export interface IOpusEncoder {
 	readonly ready: Promise<void>;
-	encodeFrame(pcmData: Uint8Array): Uint8Array[];
+	encodeFrame(pcmData: Uint8Array): EncodedFrame[];
 	getFrameSize(): number;
 	getFrameSizeBytes(): number;
 	free(): void;

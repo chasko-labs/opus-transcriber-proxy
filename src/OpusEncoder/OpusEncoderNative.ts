@@ -6,7 +6,7 @@
 // identical across the two so callers are backend-agnostic.
 
 import { nativeOpus, OPUS_APPLICATION, type NativeOpusEncoder } from '../OpusDecoder/nativeOpus';
-import type { IOpusEncoder, OpusEncoderConfig } from './opusEncoderTypes';
+import type { EncodedFrame, IOpusEncoder, OpusEncoderConfig } from './opusEncoderTypes';
 
 export class OpusEncoderNative implements IOpusEncoder {
 	private encoder: NativeOpusEncoder | null = null;
@@ -24,6 +24,7 @@ export class OpusEncoderNative implements IOpusEncoder {
 			application: config.application || 'voip',
 			bitrate: config.bitrate || 64000,
 			complexity: config.complexity || 5,
+			dtx: config.dtx ?? false,
 		};
 
 		this.ready = this.init();
@@ -39,11 +40,14 @@ export class OpusEncoderNative implements IOpusEncoder {
 
 		this.encoder.setBitrate(this.config.bitrate);
 		this.encoder.setComplexity(this.config.complexity);
+		if (this.config.dtx) {
+			this.encoder.setDtx(true);
+		}
 
 		this.isReady = true;
 	}
 
-	encodeFrame(pcmData: Uint8Array): Uint8Array[] {
+	encodeFrame(pcmData: Uint8Array): EncodedFrame[] {
 		if (!this.isReady || !this.encoder) {
 			throw new Error('Encoder not ready');
 		}
@@ -55,13 +59,13 @@ export class OpusEncoderNative implements IOpusEncoder {
 		this.inputBuffer = newBuffer;
 
 		const frameSizeBytes = this.getFrameSizeBytes();
-		const encodedFrames: Uint8Array[] = [];
+		const encodedFrames: EncodedFrame[] = [];
 
 		while (this.inputBuffer.length >= frameSizeBytes) {
 			const frameData = this.inputBuffer.subarray(0, frameSizeBytes);
 
-			const encoded = this.encoder.encode(Buffer.from(frameData), this.frameSize);
-			encodedFrames.push(new Uint8Array(encoded));
+			const { packet, inDtx } = this.encoder.encode(Buffer.from(frameData), this.frameSize);
+			encodedFrames.push({ data: new Uint8Array(packet), inDtx });
 
 			this.inputBuffer = this.inputBuffer.subarray(frameSizeBytes);
 		}

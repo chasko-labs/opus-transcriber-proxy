@@ -28,11 +28,14 @@ export interface NativeOpusEncoder {
 	/**
 	 * @param pcm       Little-endian interleaved int16 PCM for exactly one frame.
 	 * @param frameSize Samples per channel in `pcm`.
-	 * @returns The encoded Opus packet.
+	 * @returns The encoded Opus packet plus whether libopus treated it as a DTX frame (only
+	 *          meaningful when DTX is enabled via {@link setDtx}).
 	 */
-	encode(pcm: Buffer, frameSize: number): Buffer;
+	encode(pcm: Buffer, frameSize: number): { packet: Buffer; inDtx: boolean };
 	setBitrate(bitrate: number): void;
 	setComplexity(complexity: number): void;
+	/** Enable/disable Opus DTX (OPUS_SET_DTX). */
+	setDtx(enable: boolean): void;
 	destroy(): void;
 }
 

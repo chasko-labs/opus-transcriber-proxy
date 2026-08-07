@@ -7,7 +7,7 @@
 // therefore asynchronous; callers already await `ready` before encoding, so behaviour is unchanged.
 
 import { config } from '../config';
-import type { IOpusEncoder, OpusEncoderConfig } from './opusEncoderTypes';
+import type { EncodedFrame, IOpusEncoder, OpusEncoderConfig } from './opusEncoderTypes';
 
 export type { OpusEncoderConfig, OpusEncoderSampleRate } from './opusEncoderTypes';
 
@@ -40,7 +40,7 @@ export class OpusEncoder implements IOpusEncoder {
 		return this.impl;
 	}
 
-	encodeFrame(pcmData: Uint8Array): Uint8Array[] {
+	encodeFrame(pcmData: Uint8Array): EncodedFrame[] {
 		return this.require().encodeFrame(pcmData);
 	}
 

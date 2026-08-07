@@ -279,6 +279,10 @@ export class TranslatorConnection {
 				application: 'voip',
 				bitrate: 64000,
 				complexity: 5,
+				// DTX lets libopus's VAD flag comfort-noise/silence frames (EncodedFrame.inDtx). We use that to
+				// bracket talks by actual voice and to drop silence frames, since the translated audio stream is
+				// otherwise continuous (OpenAI keeps emitting during input silence). See sendAudioFrame.
+				dtx: true,
 			});
 
 			await this.opusEncoder.ready;
@@ -637,10 +641,8 @@ export class TranslatorConnection {
 						// delta is base64-encoded PCM16 audio at 24kHz
 						const pcmBytes = fromBase64(delta);
 						const opusFrames = this.opusEncoder.encodeFrame(pcmBytes);
-						if (opusFrames.length > 0) {
-							for (const frame of opusFrames) {
-								this.sendAudioFrame(frame);
-							}
+						for (const frame of opusFrames) {
+							this.sendAudioFrame(frame.data, frame.inDtx);
 						}
 					} catch (error) {
 						this.logError(`Failed to encode audio delta:`, error);
@@ -688,10 +690,20 @@ export class TranslatorConnection {
 		}
 	}
 
-	private sendAudioFrame(opusFrame: Uint8Array): void {
+	private sendAudioFrame(opusFrame: Uint8Array, inDtx: boolean): void {
+		// DTX frame: libopus's VAD marked this as comfort-noise/silence, not voice. Don't forward it to the
+		// bridge and don't count it as talk activity. The silence timer (armed only by the voice frames below)
+		// then ends the talk after the configured silence, and the RtpTimestamper inserts the real gap when
+		// voice resumes — so a live mic's continuous ambient/near-silent output no longer holds the talk open
+		// forever, and no silence packets are sent downstream.
+		if (inDtx) {
+			return;
+		}
+
 		// The RtpTimestamper produces a monotonic RTP timestamp (inserting a real-silence gap when the
-		// source idled longer than the buffered media) and a uint16 RTP sequence number. JVB's
-		// Conference.handleMediaMessage reinterprets `media.chunk` as that 16-bit RTP sequence number.
+		// source idled longer than the buffered media — e.g. across the DTX frames we skipped above) and a
+		// uint16 RTP sequence number. JVB's Conference.handleMediaMessage reinterprets `media.chunk` as that
+		// 16-bit RTP sequence number.
 		const { timestamp, sequenceNumber: rtpSequenceNumber, bufferAheadMs } = this.rtpTimestamper.nextFrameTimestamp();
 
 		// First frame of a talk: emit the talk-start boundary at this frame's timestamp, and reset the run's

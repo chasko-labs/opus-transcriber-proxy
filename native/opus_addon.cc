@@ -149,6 +149,7 @@ class OpusEncoderWrap : public Napi::ObjectWrap<OpusEncoderWrap> {
                            InstanceMethod("encode", &OpusEncoderWrap::Encode),
                            InstanceMethod("setBitrate", &OpusEncoderWrap::SetBitrate),
                            InstanceMethod("setComplexity", &OpusEncoderWrap::SetComplexity),
+                           InstanceMethod("setDtx", &OpusEncoderWrap::SetDtx),
                            InstanceMethod("destroy", &OpusEncoderWrap::Destroy),
                        });
   }
@@ -213,7 +214,17 @@ class OpusEncoderWrap : public Napi::ObjectWrap<OpusEncoderWrap> {
       return env.Null();
     }
 
-    return Napi::Buffer<char>::Copy(env, reinterpret_cast<char*>(out), bytes);
+    // Whether libopus emitted this as a DTX frame (only meaningful when DTX is enabled via setDtx). The
+    // ctl return is intentionally unchecked: `in_dtx` is pre-initialised to 0 (not-DTX), which is the
+    // correct fallback, so a (not-expected on a live encoder) failure just reports the frame as voice —
+    // never a false silence. Mirrors opus_frame_encoder.c, which clears its cached flag on ctl failure.
+    int in_dtx = 0;
+    opus_encoder_ctl(encoder_, OPUS_GET_IN_DTX(&in_dtx));
+
+    Napi::Object result = Napi::Object::New(env);
+    result.Set("packet", Napi::Buffer<char>::Copy(env, reinterpret_cast<char*>(out), bytes));
+    result.Set("inDtx", Napi::Boolean::New(env, in_dtx != 0));
+    return result;
   }
 
   void SetBitrate(const Napi::CallbackInfo& info) {
@@ -235,6 +246,23 @@ class OpusEncoderWrap : public Napi::ObjectWrap<OpusEncoderWrap> {
     int complexity = info[0].As<Napi::Number>().Int32Value();
     if (opus_encoder_ctl(encoder_, OPUS_SET_COMPLEXITY(complexity)) != OPUS_OK) {
       Napi::Error::New(env, "Invalid complexity").ThrowAsJavaScriptException();
+    }
+  }
+
+  void SetDtx(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (encoder_ == nullptr || info.Length() < 1) {
+      return;
+    }
+    int enable = info[0].ToBoolean().Value() ? 1 : 0;
+    // DTX only takes effect under VBR (libopus's default). Enforce it when enabling DTX so a later CBR
+    // change can't silently disable DTX and the voice detection built on OPUS_GET_IN_DTX.
+    if (enable && opus_encoder_ctl(encoder_, OPUS_SET_VBR(1)) != OPUS_OK) {
+      Napi::Error::New(env, "Failed to enable VBR for DTX").ThrowAsJavaScriptException();
+      return;
+    }
+    if (opus_encoder_ctl(encoder_, OPUS_SET_DTX(enable)) != OPUS_OK) {
+      Napi::Error::New(env, "Failed to set DTX").ThrowAsJavaScriptException();
     }
   }
 

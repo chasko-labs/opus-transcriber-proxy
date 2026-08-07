@@ -78,8 +78,9 @@ describeIfWasm('Opus round trip (encoder → decoder)', () => {
 	it('round-trips a 440 Hz tone with comparable energy and sane opus packet sizes', () => {
 		const pcm = generateSineWavePcm16(TOTAL_SAMPLES, SAMPLE_RATE, TONE_HZ, TONE_AMPLITUDE);
 
-		// Encoder accumulates internally and returns one opus frame per 20 ms of PCM.
-		const opusFrames = encoder.encodeFrame(pcm);
+		// Encoder accumulates internally and returns one opus frame per 20 ms of PCM. Unwrap EncodedFrame to
+		// the raw Opus bytes (DTX is off here, so inDtx is irrelevant to this round-trip).
+		const opusFrames = encoder.encodeFrame(pcm).map((f) => f.data);
 		expect(opusFrames.length).toBeGreaterThan(0);
 
 		// At 32 kbps mono with 20 ms frames the average payload is ~80 bytes.
