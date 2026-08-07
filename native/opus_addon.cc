@@ -214,7 +214,10 @@ class OpusEncoderWrap : public Napi::ObjectWrap<OpusEncoderWrap> {
       return env.Null();
     }
 
-    // Whether libopus emitted this as a DTX frame (only meaningful when DTX is enabled via setDtx).
+    // Whether libopus emitted this as a DTX frame (only meaningful when DTX is enabled via setDtx). The
+    // ctl return is intentionally unchecked: `in_dtx` is pre-initialised to 0 (not-DTX), which is the
+    // correct fallback, so a (not-expected on a live encoder) failure just reports the frame as voice —
+    // never a false silence. Mirrors opus_frame_encoder.c, which clears its cached flag on ctl failure.
     int in_dtx = 0;
     opus_encoder_ctl(encoder_, OPUS_GET_IN_DTX(&in_dtx));
 
