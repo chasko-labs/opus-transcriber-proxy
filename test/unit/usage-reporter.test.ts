@@ -33,7 +33,7 @@ describe('usage-reporter', () => {
 		vi.unstubAllGlobals();
 	});
 
-	it('POSTs one event with the token as bearer and only duration_seconds in the body', async () => {
+	it('POSTs one event with the token as bearer, duration_seconds + a UUID event_id in the body', async () => {
 		const fetchMock = okFetch();
 		vi.stubGlobal('fetch', fetchMock);
 
@@ -46,8 +46,24 @@ describe('usage-reporter', () => {
 		expect((init as RequestInit).method).toBe('POST');
 		expect((init as any).headers.Authorization).toBe('Bearer tt_abc');
 		expect(JSON.parse((init as RequestInit).body as string)).toEqual({
-			events: [{ duration_seconds: 42.5 }],
+			events: [{ duration_seconds: 42.5, event_id: expect.any(String) }],
 		});
+		// targetLanguage stays local-only — never in the body.
+		expect((init as RequestInit).body).not.toContain('targetLanguage');
+		expect((init as RequestInit).body).not.toContain('"es"');
+	});
+
+	it('preserves a caller-supplied eventId instead of minting a fresh one', async () => {
+		const fetchMock = okFetch();
+		vi.stubGlobal('fetch', fetchMock);
+
+		reportTranslationUsage(
+			{ token: 'tt_abc', durationSeconds: 1, targetLanguage: 'es', eventId: 'caller-supplied-key' },
+			{ url: URL, logger: stubLogger() },
+		);
+		await flushTranslationUsage();
+
+		expect(postedBodies(fetchMock)[0].events).toEqual([{ duration_seconds: 1, event_id: 'caller-supplied-key' }]);
 	});
 
 	it('groups by token — two tokens produce two POSTs', async () => {
@@ -65,8 +81,14 @@ describe('usage-reporter', () => {
 		for (const [, init] of fetchMock.mock.calls) {
 			byToken.set((init as any).headers.Authorization, JSON.parse((init as RequestInit).body as string));
 		}
-		expect(byToken.get('Bearer tt_a').events).toEqual([{ duration_seconds: 1 }, { duration_seconds: 3 }]);
-		expect(byToken.get('Bearer tt_b').events).toEqual([{ duration_seconds: 2 }]);
+		expect(byToken.get('Bearer tt_a').events).toEqual([
+			{ duration_seconds: 1, event_id: expect.any(String) },
+			{ duration_seconds: 3, event_id: expect.any(String) },
+		]);
+		expect(byToken.get('Bearer tt_b').events).toEqual([{ duration_seconds: 2, event_id: expect.any(String) }]);
+		// Each reported event gets its own key.
+		const [a0, a1] = byToken.get('Bearer tt_a').events;
+		expect(a0.event_id).not.toBe(a1.event_id);
 	});
 
 	it('drops events with no token or non-positive duration', async () => {
@@ -134,7 +156,10 @@ describe('usage-reporter', () => {
 		await flushTranslationUsage();
 
 		expect(fetchMock).toHaveBeenCalledTimes(1);
-		expect(postedBodies(fetchMock)[0].events).toEqual([{ duration_seconds: 5 }, { duration_seconds: 7 }]);
+		expect(postedBodies(fetchMock)[0].events).toEqual([
+			{ duration_seconds: 5, event_id: expect.any(String) },
+			{ duration_seconds: 7, event_id: expect.any(String) },
+		]);
 	});
 
 	it('auto-flushes on the 1000ms timer when under the size threshold', async () => {
@@ -151,7 +176,7 @@ describe('usage-reporter', () => {
 			await vi.runAllTimersAsync();
 
 			expect(fetchMock).toHaveBeenCalledTimes(1);
-			expect(postedBodies(fetchMock)[0].events).toEqual([{ duration_seconds: 3 }]);
+			expect(postedBodies(fetchMock)[0].events).toEqual([{ duration_seconds: 3, event_id: expect.any(String) }]);
 		} finally {
 			vi.useRealTimers();
 		}

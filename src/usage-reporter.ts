@@ -29,6 +29,13 @@ export interface TranslationUsageEvent {
 	durationSeconds: number;
 	/** ISO target language — local logging only; NOT included in the POST body. */
 	targetLanguage: string;
+	/**
+	 * Per-event idempotency key, sent as `event_id` so the receiver can dedupe a
+	 * replayed report and not double-bill. Opaque to the receiver — only its
+	 * uniqueness matters. Optional: reportTranslationUsage assigns a fresh UUID
+	 * when absent, so every reported event carries one without each caller minting it.
+	 */
+	eventId?: string;
 }
 
 /** Dependencies injected by the host runtime on each report. */
@@ -76,7 +83,9 @@ export function reportTranslationUsage(event: TranslationUsageEvent, deps: Usage
 	if (!event.token) return; // dev/replay path or ungated session — nothing to attribute
 	if (!(event.durationSeconds > 0)) return;
 
-	buffer.push(event);
+	// Assign the idempotency key here (the single choke point) so every reported
+	// event carries one — a fresh UUID per delta — without each caller minting it.
+	buffer.push({ ...event, eventId: event.eventId ?? crypto.randomUUID() });
 	if (buffer.length >= FLUSH_MAX_EVENTS) {
 		void flushTranslationUsage();
 	} else if (!flushTimer) {
@@ -145,8 +154,8 @@ async function postBatch(url: string, token: string, events: TranslationUsageEve
 				Authorization: `Bearer ${token}`,
 			},
 			body: JSON.stringify({
-				// Only duration_seconds is sent; targetLanguage is local-only (see the interface).
-				events: events.map((e) => ({ duration_seconds: e.durationSeconds })),
+				// duration_seconds + event_id (idempotency key) are sent; targetLanguage is local-only.
+				events: events.map((e) => ({ duration_seconds: e.durationSeconds, event_id: e.eventId })),
 			}),
 		});
 		if (!response.ok) {
