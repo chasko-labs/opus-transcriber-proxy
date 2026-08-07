@@ -77,6 +77,10 @@ export function createWorkerTranslationRuntime(env: Env, request?: Request): Tra
 				// peer's logs without echoing the endpoint into them.
 				config: { usageReporting: !!env.TRANSLATION_USAGE_URL },
 			};
+			// The Docker image tag the WASM Opus codec was sourced from. `gitHash` above is the WORKER CODE's
+			// commit; this is the codec's origin, which is deployed independently — reporting both lets the peer
+			// spot a code/WASM version mismatch (the two can drift, e.g. code from a branch + WASM from `latest`).
+			if (env.SOURCE_IMAGE_TAG) info.sourceImageTag = env.SOURCE_IMAGE_TAG;
 			const worker: Record<string, unknown> = { present: true };
 			if (env.CF_VERSION_METADATA) {
 				worker.versionId = env.CF_VERSION_METADATA.id;

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { buildServerInfo } from '../../src/serverInfo';
 
 describe('buildServerInfo', () => {
-	const cfEnvKeys = ['CLOUDFLARE_DURABLE_OBJECT_ID', 'CONTAINER_INSTANCE_NAME', 'CLOUDFLARE_LOCATION', 'CLOUDFLARE_COUNTRY_A2'];
+	const cfEnvKeys = ['CLOUDFLARE_DURABLE_OBJECT_ID', 'CONTAINER_INSTANCE_NAME', 'CLOUDFLARE_LOCATION', 'CLOUDFLARE_COUNTRY_A2', 'SOURCE_IMAGE_TAG'];
 	let saved: Record<string, string | undefined>;
 
 	beforeEach(() => {
@@ -62,5 +62,16 @@ describe('buildServerInfo', () => {
 	it('omits sessionId when not provided', () => {
 		const info = buildServerInfo({});
 		expect('sessionId' in info).toBe(false);
+	});
+
+	it('surfaces sourceImageTag when SOURCE_IMAGE_TAG is set', () => {
+		process.env.SOURCE_IMAGE_TAG = 'v1.2.3';
+		const info = buildServerInfo({});
+		expect(info.sourceImageTag).toBe('v1.2.3');
+	});
+
+	it('omits sourceImageTag when SOURCE_IMAGE_TAG is unset', () => {
+		const info = buildServerInfo({});
+		expect('sourceImageTag' in info).toBe(false);
 	});
 });
