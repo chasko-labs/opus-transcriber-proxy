@@ -130,6 +130,7 @@ Speech-to-speech translation via OpenAI's realtime translations endpoint (`gpt-r
 | `TRANSLATION_USAGE_URL` | (unset) | Endpoint that receives translated-audio duration usage reports; unset → usage reporting is a no-op |
 | `TRANSLATION_USAGE_REPORT_INTERVAL_MS` | `15000` | Interval between incremental usage reports for an open translation direction; `<= 0` reports only the final delta at close |
 | `TRANSLATION_TALK_SILENCE_TIMEOUT_MS` | `350` | Silence (ms past projected media playout) before a translated "talk" ends and a `sending=false` notification is emitted to clients. Must exceed the 100 ms RtpTimestamper gap threshold; `<= 0` disables end-of-talk detection — unsafe on the translations endpoint (which sends no boundary event), where a talk would then never end until the connection closes |
+| `SOURCE_IMAGE_TAG` | (unset) | Set by the translate-Worker deploy to the Docker image tag its WASM Opus codec was sourced from (the codec is versioned independently of the worker code). Surfaced as `sourceImageTag` in the `info` message so a code/WASM mismatch is visible against `gitHash`; not used at runtime |
 
 ### Dispatcher (Optional)
 
