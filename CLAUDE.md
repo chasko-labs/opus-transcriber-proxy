@@ -394,6 +394,7 @@ When audio stops flowing, `OutgoingConnection` waits `FORCE_COMMIT_TIMEOUT` seco
 ```
 src/
 ├── server.ts                  # HTTP/WS server entry (Node.js)
+├── monitor.ts                 # Synthetic health-check entrypoint (see Debugging Tools > Monitor Mode)
 ├── transcriberproxy.ts        # Main proxy orchestration
 ├── translatorproxy.ts         # /translate orchestration (runtime-agnostic core)
 ├── TranslatorConnection.ts    # One per (source, language) OpenAI realtime session
@@ -478,6 +479,44 @@ npm run mix-audio -- /tmp/session123/media.jsonl output.wav
 # Mixes all participant audio streams into a single WAV file
 # Decodes via the OPUS_BACKEND-selected backend (default wasm); prefix OPUS_BACKEND=native to use the addon
 ```
+
+### Monitor Mode (`src/monitor.ts`)
+
+A second entrypoint bundled into the same image (`node dist/bundle/monitor.js`, vs. the default
+`node dist/bundle/server.js`), used as a synthetic-check sidecar in deployment. Instead of serving
+transcription, it periodically replays `resources/sample.jsonl` (via `scripts/replay-dump.cjs --ci`)
+against a target `/transcribe` URL and exposes a Prometheus `/metrics` endpoint with a
+`opus_transcriber_proxy_monitor_healthy` gauge, plus `/health` for liveness.
+
+A check is unhealthy only if all `MONITOR_ATTEMPTS` attempts fail; all attempts reuse the same
+`sessionId` so a retry lands on the container/session the first attempt warmed. After the sample
+finishes replaying, `replay-dump.cjs` keeps the socket open — but in `--ci` mode closes as soon as
+the `--assert-min-finals` threshold is met rather than waiting out the full `--drain` window, so a
+slow-but-successful transcription doesn't get scored as a failure (see PR #119: this was the root
+cause of at least two production false-positive alerts — the fixed-length drain that preceded it
+closed the socket just before the provider's trailing final arrived, even though the backend had
+transcribed correctly).
+
+```bash
+MONITOR_URL="wss://host/transcribe?sessionId=__SESSION_ID__&sendBack=true" node dist/bundle/monitor.js
+```
+
+Configured entirely from the environment:
+- `MONITOR_URL` — target `/transcribe` URL; `__SESSION_ID__` is replaced per check with a fresh `monitor-<random>` id
+- `MONITOR_INTERVAL_SECONDS` — seconds between checks (default 300)
+- `MONITOR_ATTEMPTS` — attempts per check (default 3, clamped to at least 1)
+- `MONITOR_RETRY_DELAY_SECONDS` — wait before each retry after a failed attempt (default 20)
+- `MONITOR_CONNECT_TIMEOUT` — seconds to wait for the WebSocket to open (default 30; must cover a Cloudflare Container cold start)
+- `MONITOR_DRAIN_SECONDS` — after the sample finishes replaying, how long to keep the socket open for trailing finals before giving up (default 10); an upper bound only — see above
+- `MONITOR_MIN_FINALS` — minimum final transcripts required to pass (default 1)
+- `MONITOR_SAMPLE` — path to the JSONL Opus dump to replay (default `resources/sample.jsonl`)
+- `MONITOR_HEADERS` — extra request headers as a JSON object (e.g. CF Access service-token headers)
+- `MONITOR_PORT` / `PORT` — port for the metrics HTTP server (default 8080)
+
+Note: the monitor process does not self-report its build (`gitHash`) anywhere — `monitor.ts` doesn't
+import `src/buildInfo.ts`, so it emits no log line, no `/metrics` label, and sends no `info` message.
+To identify which commit a running monitor sidecar is from, check the `server.js` bundle shipped in
+the same image (same build) instead.
 
 ## WebSocket Protocol
 
@@ -564,6 +603,8 @@ See README.md for complete list. Key ones:
 - `TRANSLATION_USAGE_REPORT_INTERVAL_MS` - Interval between periodic incremental usage reports for an open translation direction (default: 15000; `<= 0` disables the timer so only the final delta at close is reported). Resolved by both the Node and Worker translation runtimes
 - `TRANSLATION_TALK_SILENCE_TIMEOUT_MS` - Silence timeout (ms) for detecting the end of a translated-audio "talk". The `/v1/realtime/translations` endpoint streams output-audio deltas with no per-utterance boundary event, so a talk ends when the output goes silent and the next delta starts a new one (drives the `SyntheticSourceSendingChangeEvent` sent to clients). Measured from the projected media playout end (OpenAI streams faster than real time, so the consumer keeps playing a burst after the last frame arrives), not from frame arrival. Default 350; must exceed the RtpTimestamper 100ms gap threshold. `<= 0` disables silence-based inference — unsafe for `/v1/realtime/translations` (which sends no boundary event), where it would mean a talk never ends until the connection closes; only disable against an endpoint that emits explicit done events. Resolved by both the Node and Worker translation runtimes
 - `OPUS_BACKEND` - Opus codec backend: `wasm` (default; required in a Worker) or `native` (libopus addon, container-only, faster)
+
+`MONITOR_*` vars configure the separate monitor entrypoint (`src/monitor.ts`), not the proxy server — see "Monitor Mode" under Debugging Tools.
 
 The CF Worker forwards `ENABLE_TRANSCRIBE`/`ENABLE_TRANSLATE`/`TRANSLATE_TRANSCRIPTS`/`OPENAI_TRANSLATION_MODEL`/`OPENAI_TRANSLATION_API_KEY`/`TRANSLATION_TALK_SILENCE_TIMEOUT_MS` to the container (only when set, so container defaults apply otherwise) via `buildContainerEnvVars`. (In the CF deployment `/translate` is served by the Worker, not the container; the translation vars matter for a standalone container that serves `/translate` itself.)
 
