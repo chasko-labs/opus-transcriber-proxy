@@ -23,7 +23,12 @@
  *                    treats a WebSocket-level error as failure, enforces --connect-timeout, and on
  *                    close checks any --assert-min-* thresholds, printing a final
  *                    "INTEGRATION_RESULT: PASS|FAIL" line and exiting 0/1 accordingly. Without --ci
- *                    the script behaves exactly as before (always exits 0, no assertions).
+ *                    the script behaves exactly as before (always exits 0, no assertions). A
+ *                    WS-level error, an uncaught exception, or an unhandled rejection all print a
+ *                    FAIL line with as much of the underlying error as Node exposes — .code/.errno/
+ *                    .syscall/.address/.port and any wrapped .cause/.errors[] (needed because a
+ *                    connect failure often surfaces as an AggregateError whose own .message is
+ *                    empty, with the real "connect ECONNREFUSED host:port" detail only in .errors[]).
  *   --connect-timeout=<sec> - (--ci only) fail if the WebSocket doesn't open within this many
  *                  seconds (default 15).
  *   --drain=<sec>  - After the last frame is sent, keep the socket open up to this long for trailing
@@ -464,19 +469,55 @@ ws.on('message', (data) => {
     }
 });
 
+// error.message is sometimes empty (seen for a WS-level error with no application-layer response —
+// e.g. the request never reaching the server at all). Node's underlying system errors (DNS/TCP/TLS
+// failures) carry the real detail in .code/.errno/.syscall/.address/.port instead, and .cause chains
+// through a wrapped error — pull all of it in so a bare error still says something useful.
+function describeError(err) {
+    if (!err || typeof err !== 'object') return String(err);
+    const parts = [];
+    parts.push(err.name && err.name !== 'Error' ? `${err.name}: ${err.message || '(no message)'}` : (err.message || '(no message)'));
+    for (const field of ['code', 'errno', 'syscall', 'address', 'port']) {
+        if (err[field] !== undefined) parts.push(`${field}=${err[field]}`);
+    }
+    if (err.cause) parts.push(`cause=(${describeError(err.cause)})`);
+    // Node's connect path (dual-stack IPv4/IPv6) reports failure as an AggregateError whose own
+    // .message is empty — the actual per-address reason (e.g. "connect ECONNREFUSED 127.0.0.1:PORT")
+    // is only in .errors[]. Without this, an AggregateError prints as just "code=..." with no
+    // indication of what host/port was actually being connected to.
+    if (Array.isArray(err.errors) && err.errors.length > 0) {
+        parts.push(`errors=[${err.errors.map(describeError).join('; ')}]`);
+    }
+    return parts.join(' ');
+}
+
 ws.on('error', (error) => {
     process.stdout.write('\r' + ' '.repeat(120) + '\r'); // Clear status line
-    console.error('WebSocket error:', error.message);
+    console.error('WebSocket error:', describeError(error));
     if (ciMode) {
         // process.exit() here is synchronous and load-bearing: it's what makes a WS-level error a
         // hard FAIL. The 'close' handler's --assert-min-* checks below have no way to distinguish
         // "0 transcripts because nothing arrived" from "0 transcripts because we errored out before
         // anything could arrive" — without this exit, a connection error with assertions unset
         // would fall through to 'close' and print a false PASS.
-        console.error(`INTEGRATION_RESULT: FAIL: WebSocket error: ${error.message}`);
+        console.error(`INTEGRATION_RESULT: FAIL: WebSocket error: ${describeError(error)}`);
         process.exit(1);
     }
 });
+
+if (ciMode) {
+    // Safety net: without this, a crash before any INTEGRATION_RESULT line (e.g. an unhandled promise
+    // rejection somewhere in the ws internals) surfaces to the monitor as the opaque "replay exited N
+    // with no result line" — no detail on what actually happened. Print what we can before exiting.
+    process.on('uncaughtException', (err) => {
+        console.error(`INTEGRATION_RESULT: FAIL: uncaught exception: ${describeError(err)}`);
+        process.exit(1);
+    });
+    process.on('unhandledRejection', (err) => {
+        console.error(`INTEGRATION_RESULT: FAIL: unhandled rejection: ${describeError(err)}`);
+        process.exit(1);
+    });
+}
 
 ws.on('close', () => {
     if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
