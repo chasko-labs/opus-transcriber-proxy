@@ -27,7 +27,18 @@
 //                                arrive, so the full drain elapses only when they never do. Raising it
 //                                widens the tolerance for a slow provider finalization.
 //   MONITOR_SAMPLE               path to the JSONL Opus dump to replay (default resources/sample.jsonl)
+//   MONITOR_REPLAY_SPEED         playback speed for the sample replay (default 1, i.e. real time).
+//                                Real-time pacing matches how a real client sends audio (paced 20ms
+//                                Opus frames), which is what a provider's silence-based finalization
+//                                (e.g. xAI's `endpointing`) is actually calibrated against. A full-speed
+//                                blast (0 = no delay) compresses away the inter-utterance silence gaps
+//                                and can make finalization land far later than it would for real
+//                                traffic, causing false alarms unrelated to backend health.
 //   MONITOR_MIN_FINALS           minimum final transcripts required to pass (default 1)
+//   MONITOR_COUNT_INTERIMS       when true (default), MONITOR_MIN_FINALS interim transcripts also
+//                                satisfy the check, not just finals. A provider that is visibly
+//                                transcribing (interims flowing) but hasn't finalized yet is not a
+//                                backend failure — set to false to require finals strictly.
 //   MONITOR_PORT / PORT          port for the metrics HTTP server (default 8080)
 
 import http from 'node:http';
@@ -41,6 +52,10 @@ const CONNECT_TIMEOUT = process.env.MONITOR_CONNECT_TIMEOUT || '30';
 const DRAIN = process.env.MONITOR_DRAIN_SECONDS || '10';
 const MIN_FINALS = process.env.MONITOR_MIN_FINALS || '1';
 const SAMPLE = process.env.MONITOR_SAMPLE || 'resources/sample.jsonl';
+const REPLAY_SPEED = process.env.MONITOR_REPLAY_SPEED || '1';
+// Default true: an interim shows the backend is actively transcribing, which is what this check
+// cares about — see the header comment above for why finals-only is too strict.
+const COUNT_INTERIMS = process.env.MONITOR_COUNT_INTERIMS !== 'false';
 const URL_TEMPLATE = process.env.MONITOR_URL;
 const REPLAY_SCRIPT = 'scripts/replay-dump.cjs';
 // Number of attempts per check; the check is unhealthy only if all of them fail. All attempts of a
@@ -96,7 +111,10 @@ interface AttemptResult {
 function runAttempt(sessionId: string, attemptNo: number): Promise<AttemptResult> {
 	return new Promise((resolve) => {
 		const url = (URL_TEMPLATE as string).replace('__SESSION_ID__', sessionId);
-		const args = [REPLAY_SCRIPT, SAMPLE, url, '0', '--ci', `--connect-timeout=${CONNECT_TIMEOUT}`, `--drain=${DRAIN}`, `--assert-min-finals=${MIN_FINALS}`];
+		const finalsAssertFlag = COUNT_INTERIMS
+			? `--assert-min-finals-or-interims=${MIN_FINALS}`
+			: `--assert-min-finals=${MIN_FINALS}`;
+		const args = [REPLAY_SCRIPT, SAMPLE, url, REPLAY_SPEED, '--ci', `--connect-timeout=${CONNECT_TIMEOUT}`, `--drain=${DRAIN}`, finalsAssertFlag];
 		// Headers go to the replay via REPLAY_HEADERS (env), never on the command line, so
 		// credential-bearing values stay out of the process argument list.
 		const childEnv = { ...process.env };
@@ -124,10 +142,12 @@ function runAttempt(sessionId: string, attemptNo: number): Promise<AttemptResult
 			const resultLine = (buf.match(/INTEGRATION_RESULT:[^\n]*/g) || []).pop();
 			const finalsMatch = buf.match(/(\d+)\s+final transcript/);
 			const finals = finalsMatch ? parseInt(finalsMatch[1], 10) : 0;
+			const interimsMatch = buf.match(/(\d+)\s+interim/);
+			const interims = interimsMatch ? parseInt(interimsMatch[1], 10) : 0;
 			const transcriptMatch = buf.match(/^\[[^\]]+\]\s+\([^)]*\)\s+(.+)$/m);
 			const transcript = transcriptMatch ? transcriptMatch[1].trim().slice(0, 80) : '';
 			if (ok) {
-				log(`monitor: attempt ${attemptNo}/${ATTEMPTS} PASS in ${secs}s (finals=${finals}${transcript ? `, "${transcript}"` : ''})`);
+				log(`monitor: attempt ${attemptNo}/${ATTEMPTS} PASS in ${secs}s (finals=${finals}, interims=${interims}${transcript ? `, "${transcript}"` : ''})`);
 			} else {
 				const reason = resultLine
 					? resultLine.replace('INTEGRATION_RESULT: ', '').replace('FAIL: ', '')

@@ -32,6 +32,11 @@
  *                  elapses only when the expected transcripts never arrive.
  *   --assert-min-finals=<N>   - (--ci only) fail unless at least N final transcripts were received.
  *   --assert-min-interims=<N> - (--ci only) fail unless at least N interim transcripts were received.
+ *   --assert-min-finals-or-interims=<N> - (--ci only) fail unless at least N final OR N interim
+ *                  transcripts were received (either counts). Use this instead of
+ *                  --assert-min-finals when a slow-to-finalize provider (or a fast/full-speed replay
+ *                  that throws off silence-based finalization timing) should not fail the check as
+ *                  long as the backend is visibly transcribing.
  *   --assert-min-media=<N>    - (--ci only) fail unless at least N translated media packets were received.
  *
  * Example:
@@ -178,6 +183,7 @@ let connectTimeoutSec = 15;
 let drainSec = 10; // seconds to keep the socket open after the last frame for trailing finals (the cap)
 let assertMinFinals = null;
 let assertMinInterims = null;
+let assertMinFinalsOrInterims = null;
 let assertMinMedia = null;
 
 for (let i = 0; i < extraArgs.length; i++) {
@@ -202,6 +208,8 @@ for (let i = 0; i < extraArgs.length; i++) {
         assertMinFinals = parseInt(arg.slice('--assert-min-finals='.length), 10);
     } else if (arg.startsWith('--assert-min-interims=')) {
         assertMinInterims = parseInt(arg.slice('--assert-min-interims='.length), 10);
+    } else if (arg.startsWith('--assert-min-finals-or-interims=')) {
+        assertMinFinalsOrInterims = parseInt(arg.slice('--assert-min-finals-or-interims='.length), 10);
     } else if (arg.startsWith('--assert-min-media=')) {
         assertMinMedia = parseInt(arg.slice('--assert-min-media='.length), 10);
     } else if (!isNaN(parseFloat(arg)) && i === 0) {
@@ -302,10 +310,11 @@ let connectTimeoutHandle = null;
 let drainTimer = null;
 let replayComplete = false;
 let earlyClosed = false;
-const hasCiAsserts = assertMinFinals !== null || assertMinInterims !== null || assertMinMedia !== null;
+const hasCiAsserts = assertMinFinals !== null || assertMinInterims !== null || assertMinFinalsOrInterims !== null || assertMinMedia !== null;
 function ciAssertsSatisfied() {
     if (assertMinFinals !== null && finalTranscripts < assertMinFinals) return false;
     if (assertMinInterims !== null && interimTranscripts < assertMinInterims) return false;
+    if (assertMinFinalsOrInterims !== null && finalTranscripts < assertMinFinalsOrInterims && interimTranscripts < assertMinFinalsOrInterims) return false;
     if (assertMinMedia !== null && mediaPacketsReceived < assertMinMedia) return false;
     return true;
 }
@@ -493,6 +502,9 @@ ws.on('close', () => {
         }
         if (assertMinInterims !== null && interimTranscripts < assertMinInterims) {
             failures.push(`expected >= ${assertMinInterims} interim transcript(s), got ${interimTranscripts}`);
+        }
+        if (assertMinFinalsOrInterims !== null && finalTranscripts < assertMinFinalsOrInterims && interimTranscripts < assertMinFinalsOrInterims) {
+            failures.push(`expected >= ${assertMinFinalsOrInterims} final or interim transcript(s), got ${finalTranscripts} final(s) and ${interimTranscripts} interim(s)`);
         }
         if (assertMinMedia !== null && mediaPacketsReceived < assertMinMedia) {
             failures.push(`expected >= ${assertMinMedia} media packet(s), got ${mediaPacketsReceived}`);

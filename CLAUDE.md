@@ -491,11 +491,22 @@ against a target `/transcribe` URL and exposes a Prometheus `/metrics` endpoint 
 A check is unhealthy only if all `MONITOR_ATTEMPTS` attempts fail; all attempts reuse the same
 `sessionId` so a retry lands on the container/session the first attempt warmed. After the sample
 finishes replaying, `replay-dump.cjs` keeps the socket open — but in `--ci` mode closes as soon as
-the `--assert-min-finals` threshold is met rather than waiting out the full `--drain` window, so a
+the finals/interims threshold is met rather than waiting out the full `--drain` window, so a
 slow-but-successful transcription doesn't get scored as a failure (see PR #119: this was the root
 cause of at least two production false-positive alerts — the fixed-length drain that preceded it
 closed the socket just before the provider's trailing final arrived, even though the backend had
 transcribed correctly).
+
+The sample replays at real-time pace by default (`MONITOR_REPLAY_SPEED=1`), not blasted at full
+speed: a provider's silence-based finalization (e.g. xAI's `endpointing`) is calibrated against audio
+arriving paced like a real client's 20ms frames, and a full-speed blast compresses away the
+inter-utterance silence gaps it depends on — this was a second, distinct source of false alarms
+(finals landing far later than they would for real traffic, well after `MONITOR_MIN_FINALS` gave up).
+Separately, `MONITOR_COUNT_INTERIMS` (default true) lets `MONITOR_MIN_FINALS` interim transcripts
+satisfy the check on their own — a provider that's visibly transcribing (interims flowing) just
+hasn't finalized yet is not a backend failure. Passed to `replay-dump.cjs` as
+`--assert-min-finals-or-interims=<N>` instead of `--assert-min-finals=<N>`; set to `false` to require
+finals strictly.
 
 ```bash
 MONITOR_URL="wss://host/transcribe?sessionId=__SESSION_ID__&sendBack=true" node dist/bundle/monitor.js
@@ -508,8 +519,10 @@ Configured entirely from the environment:
 - `MONITOR_RETRY_DELAY_SECONDS` — wait before each retry after a failed attempt (default 20)
 - `MONITOR_CONNECT_TIMEOUT` — seconds to wait for the WebSocket to open (default 30; must cover a Cloudflare Container cold start)
 - `MONITOR_DRAIN_SECONDS` — after the sample finishes replaying, how long to keep the socket open for trailing finals before giving up (default 10); an upper bound only — see above
-- `MONITOR_MIN_FINALS` — minimum final transcripts required to pass (default 1)
+- `MONITOR_MIN_FINALS` — minimum final (or, with `MONITOR_COUNT_INTERIMS`, interim) transcripts required to pass (default 1)
+- `MONITOR_COUNT_INTERIMS` — interim transcripts also satisfy `MONITOR_MIN_FINALS`, not just finals (default true; see above)
 - `MONITOR_SAMPLE` — path to the JSONL Opus dump to replay (default `resources/sample.jsonl`)
+- `MONITOR_REPLAY_SPEED` — sample playback speed (default 1, real time; 0 = no delay/full speed — see above)
 - `MONITOR_HEADERS` — extra request headers as a JSON object (e.g. CF Access service-token headers)
 - `MONITOR_PORT` / `PORT` — port for the metrics HTTP server (default 8080)
 
