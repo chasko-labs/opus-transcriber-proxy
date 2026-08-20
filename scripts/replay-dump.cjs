@@ -303,13 +303,17 @@ let connectTimeoutHandle = null;
 
 // Early-success close (--ci): once every set --assert-min-* threshold is met there is nothing left
 // to prove, so close immediately and let the 'close' handler report PASS — instead of holding the
-// socket open for the full drain window. This removes the timing race where a trailing final arrives
-// just after a fixed-length drain closes the socket (the monitor's main false-negative source).
-// Gated on replayComplete so we never close mid-blast (a pending ws.send() on a closing socket would
-// throw and trip the 'error' handler's hard FAIL).
+// socket open for the full drain window, or (at real-time speed) for the rest of the sample. This
+// removes the timing race where a trailing final arrives just after a fixed-length drain closes the
+// socket (the monitor's main false-negative source), and — since speed defaults to real time, where a
+// full blast used to finish sending almost instantly — avoids forcing every attempt, pass or fail, to
+// run the sample's full real-time length just to reach the "replay complete" point that used to gate
+// this. Closing mid-blast cancels the pending send timer first, so no ws.send() fires on a closing
+// socket (which would throw and trip the 'error' handler's hard FAIL).
 let drainTimer = null;
 let replayComplete = false;
 let earlyClosed = false;
+let cancelPendingSend = null; // set by the open handler; stops the in-flight real-time send loop
 const hasCiAsserts = assertMinFinals !== null || assertMinInterims !== null || assertMinFinalsOrInterims !== null || assertMinMedia !== null;
 function ciAssertsSatisfied() {
     if (assertMinFinals !== null && finalTranscripts < assertMinFinals) return false;
@@ -319,12 +323,14 @@ function ciAssertsSatisfied() {
     return true;
 }
 function finishEarly() {
-    if (earlyClosed || !ciMode || !hasCiAsserts || !replayComplete) return;
+    if (earlyClosed || !ciMode || !hasCiAsserts) return;
     if (!ciAssertsSatisfied()) return;
     earlyClosed = true;
     if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
+    const mid = !replayComplete;
+    if (mid && cancelPendingSend) cancelPendingSend();
     process.stdout.write('\r' + ' '.repeat(120) + '\r');
-    console.log(`\nAssertions satisfied (${finalTranscripts} final(s)) — closing early instead of draining.`);
+    console.log(`\nAssertions satisfied (${finalTranscripts} final(s), ${interimTranscripts} interim(s))${mid ? ' before the sample finished replaying' : ''} — closing early instead of draining.`);
     ws.close();
 }
 
@@ -357,6 +363,13 @@ ws.on('open', () => {
 
     let messageIndex = 0;
     let isComplete = false;
+    let pendingSendTimer = null;
+
+    cancelPendingSend = () => {
+        if (pendingSendTimer) { clearTimeout(pendingSendTimer); pendingSendTimer = null; }
+        isComplete = true;
+        clearInterval(statusInterval);
+    };
 
     // Periodic status update (every second)
     const statusInterval = setInterval(() => {
@@ -404,7 +417,8 @@ ws.on('open', () => {
             delay = Math.max(0, targetTime - Date.now());
         }
 
-        setTimeout(() => {
+        pendingSendTimer = setTimeout(() => {
+            pendingSendTimer = null;
             ws.send(message.data);
             messageIndex++;
             sendNextMessage();
