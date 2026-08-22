@@ -157,6 +157,29 @@ TranslatorConnection (TranslatorConnection.ts) - One per (source, language)
     └─ OpusEncoder - Re-encodes the translated PCM to Opus for the return path
 ```
 
+The `/agent` endpoint (Node-only, `ENABLE_AGENT=true` to enable) relays a conference's audio to a
+customer's voice-agent WebSocket server and returns the agent's audio to the bridge:
+
+```
+Bridge WebSocket (/agent)
+    ↓
+AgentProxy (agentproxy.ts) - one per connection
+    ├─ Dials OUT to the customer endpoint (X-Agent-Endpoint header, or ?endpoint= in dev;
+    │  wss:// enforced unless AGENT_REQUIRE_WSS=false; X-Agent-Authorization forwarded)
+    ├─ Per participant source: OpusDecoder → PCM16 mono 24 kHz → mediajson `start`/`media`
+    │  to the customer (start carries mediaFormat + customParameters from the query params)
+    └─ Return path: customer `media` (base64 PCM16 24 kHz) → OpusEncoder (DTX) →
+       AgentPacer (agent/AgentPacer.ts) → RtpTimestamper → tagged `media` + talk boundaries
+       to the bridge (the tag is the agent's synthetic source from `sources.requests`)
+```
+
+Agent-specific control events on the customer leg: `clear` (barge-in — drops the pacer's queued,
+not-yet-released audio; only the ≤ AGENT_PACE_LEAD_MS already released can still play out) and
+`mark` (playback checkpoint, echoed back when the pacer releases past it — approximates "played",
+the proxy has no client playout feedback). A customer-leg failure closes the bridge socket so the
+bridge's Exporter reconnect re-dials the endpoint (session-level retry). The pacer is pure and
+clock/timer-injectable (`test/unit/AgentPacer.test.ts`).
+
 ### Key Components
 
 **TranscriberProxy** (`src/transcriberproxy.ts`)
@@ -609,6 +632,13 @@ See README.md for complete list. Key ones:
 - `USE_DISPATCHER` - Enable dispatcher forwarding
 - `OTLP_ENDPOINT` - OTLP HTTP endpoint for metrics/logs (disabled if empty)
 - `ENABLE_TRANSCRIBE` / `ENABLE_TRANSLATE` - Per-endpoint enablement (default: true each); a disabled endpoint's WS upgrade is rejected with 404
+- `ENABLE_AGENT` - Enable the /agent voice-agent endpoint (default: **false** — it dials out to arbitrary customer WebSocket endpoints, so enabling is an explicit deployment decision)
+- `AGENT_REQUIRE_WSS` - Require wss:// for the customer agent endpoint (default: true; false allows ws:// for dev)
+- `AGENT_PACE_LEAD_MS` - How much agent audio (ms) may be released ahead of real time by the pacer (default: 200); bounds how much audio can still play out after a barge-in `clear`
+- `AGENT_SHARED_SECRET` - Shared secret gating the /agent WS upgrade; when set the caller (the bridge) must send a matching `X-Agent-Token`. Unset = unauthenticated upgrade (keep the proxy bridge-only)
+- `AGENT_ALLOWED_HOSTS` - Comma-separated allowlist of customer endpoint hosts (exact or `.suffix`). Empty = allow any public host (private ranges blocked)
+- `AGENT_ALLOW_PRIVATE_ENDPOINTS` - Dev/same-host opt-in that skips the private/internal-address SSRF denylist so the agent endpoint may be on localhost or an internal IP (default: false). Removes SSRF protection — never enable where untrusted callers can reach `/agent`
+- `AGENT_ALLOW_ENDPOINT_PARAM` - Honor the dev-only `?endpoint=` query param instead of requiring the `X-Agent-Endpoint` header (default: false)
 - `TRANSLATE_TRANSCRIPTS` - Emit target-language transcripts from `/translate` (default: true; false → translated audio only)
 - `OPENAI_TRANSLATION_MODEL` - Speech-to-speech translation model (default: `gpt-realtime-translate`)
 - `OPENAI_TRANSLATION_API_KEY` - Separate key for translation (default: falls back to `OPENAI_API_KEY`)
