@@ -21,12 +21,15 @@ function parseJsonOrDefault<T>(value: string | undefined, defaultValue: T): T {
 
 function parseAndValidateTags(value: string | undefined): string[] {
 	if (!value) return [];
-	const tags = value.split(',').map((t) => t.trim()).filter((t) => t);
+	const tags = value
+		.split(',')
+		.map((t) => t.trim())
+		.filter((t) => t);
 	validateTags(tags);
 	return tags;
 }
 
-export type Provider = 'openai' | 'openai_custom' | 'gemini' | 'deepgram' | 'xai' | 'dummy';
+export type Provider = 'openai' | 'openai_custom' | 'gemini' | 'deepgram' | 'xai' | 'aws_transcribe' | 'dummy';
 
 export const config = {
 	// Provider priority list (comma-separated, first available is default)
@@ -101,6 +104,13 @@ export const config = {
 		granularStabilityMs: parseIntOrDefault(process.env.XAI_GRANULAR_STABILITY_MS, 1000),
 		granularGuardWords: parseIntOrDefault(process.env.XAI_GRANULAR_GUARD_WORDS, 3),
 		granularMinWords: parseIntOrDefault(process.env.XAI_GRANULAR_MIN_WORDS, 5),
+	},
+
+	// AWS Transcribe configuration
+	awsTranscribe: {
+		region: process.env.AWS_TRANSCRIBE_REGION || 'us-west-2',
+		languageOptions: process.env.AWS_TRANSCRIBE_LANGUAGE_OPTIONS || 'en-US,es-US',
+		translateEnabled: process.env.AWS_TRANSLATE_ENABLED !== 'false',
 	},
 
 	// Deepgram configuration
@@ -187,6 +197,8 @@ export function isProviderAvailable(provider: Provider): boolean {
 			return !!config.deepgram.apiKey;
 		case 'xai':
 			return !!config.xai.apiKey;
+		case 'aws_transcribe':
+			return true; // Uses IAM credential chain — always available when running on AWS
 		case 'dummy':
 			return config.enableDummyProvider; // Dummy only available if explicitly enabled
 		default:
@@ -198,7 +210,7 @@ export function isProviderAvailable(provider: Provider): boolean {
  * Get all available providers
  */
 export function getAvailableProviders(): Provider[] {
-	const allProviders: Provider[] = ['openai', 'openai_custom', 'gemini', 'deepgram', 'xai', 'dummy'];
+	const allProviders: Provider[] = ['openai', 'openai_custom', 'gemini', 'deepgram', 'xai', 'aws_transcribe', 'dummy'];
 	return allProviders.filter(isProviderAvailable);
 }
 
@@ -219,5 +231,13 @@ export function getDefaultProvider(): Provider | null {
  * Validate that a provider name is valid
  */
 export function isValidProvider(provider: string): provider is Provider {
-	return provider === 'openai' || provider === 'openai_custom' || provider === 'gemini' || provider === 'deepgram' || provider === 'xai' || provider === 'dummy';
+	return (
+		provider === 'openai' ||
+		provider === 'openai_custom' ||
+		provider === 'gemini' ||
+		provider === 'deepgram' ||
+		provider === 'xai' ||
+		provider === 'aws_transcribe' ||
+		provider === 'dummy'
+	);
 }

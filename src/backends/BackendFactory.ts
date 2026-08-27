@@ -10,13 +10,19 @@ import { GeminiBackend } from './GeminiBackend';
 import { DeepgramBackend } from './DeepgramBackend';
 import { DummyBackend } from './DummyBackend';
 import { XAIBackend } from './XAIBackend';
+import { AWSTranscribeBackend } from './AWSTranscribeBackend';
 
 export interface OpenAICustomOptions {
 	openaiCustomUrl?: string;
 	openaiCustomApiKey?: string;
 }
 
-export function createBackend(tag: string, participantInfo: any, provider?: Provider, customOptions?: OpenAICustomOptions): TranscriptionBackend {
+export function createBackend(
+	tag: string,
+	participantInfo: any,
+	provider?: Provider,
+	customOptions?: OpenAICustomOptions,
+): TranscriptionBackend {
 	const backendType = provider || getDefaultProvider();
 
 	logger.info(`Creating ${backendType} transcription backend for tag: ${tag}`);
@@ -32,6 +38,8 @@ export function createBackend(tag: string, participantInfo: any, provider?: Prov
 			return new DeepgramBackend(tag, participantInfo);
 		case 'xai':
 			return new XAIBackend(tag, participantInfo);
+		case 'aws_transcribe':
+			return new AWSTranscribeBackend(tag, participantInfo);
 		case 'dummy':
 			return new DummyBackend(tag, participantInfo);
 		default:
@@ -63,6 +71,12 @@ export function getBackendConfig(provider?: Provider): BackendConfig {
 				model: config.deepgram.model,
 			};
 		case 'xai':
+			return {
+				language: undefined,
+				prompt: undefined,
+				model: undefined,
+			};
+		case 'aws_transcribe':
 			return {
 				language: undefined,
 				prompt: undefined,
