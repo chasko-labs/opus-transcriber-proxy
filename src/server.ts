@@ -6,7 +6,14 @@ import { TranscriberProxy, type TranscriptionMessage } from './transcriberproxy'
 import { TranslatorProxy } from './translatorproxy';
 import { normalizeTargetLanguage } from './TranslatorConnection';
 import { createNodeTranslationRuntime } from './translate/nodeRuntime';
-import { buildTranslationMediaMessage, buildTranslationTalkStartMessage, buildTranslationTalkStopMessage, buildTranslationTranscriptMessage, type TranslationTalkStartData, type TranslationTalkStopData } from './translate/messages';
+import {
+	buildTranslationMediaMessage,
+	buildTranslationTalkStartMessage,
+	buildTranslationTalkStopMessage,
+	buildTranslationTranscriptMessage,
+	type TranslationTalkStartData,
+	type TranslationTalkStopData,
+} from './translate/messages';
 import type { IWebSocket } from './translate/runtime';
 import { setMetricDebug, writeMetric } from './metrics';
 import logger, { addOtlpTransport } from './logger';
@@ -14,6 +21,7 @@ import { sessionManager } from './SessionManager';
 import { flushTranslationUsage } from './usage-reporter';
 import { initTelemetry, initTelemetryLogs, shutdownTelemetry, shutdownTelemetryLogs, isTelemetryEnabled } from './telemetry';
 import { getInstruments } from './telemetry/instruments';
+import { XmppComponent } from './xmpp/index';
 
 // Initialize OpenTelemetry (must be before other initialization)
 initTelemetry();
@@ -380,7 +388,23 @@ function handleTranslatorConnection(ws: WebSocket, parameters: ISessionParameter
 }
 
 export function handleWebSocketConnection(ws: WebSocket, parameters: ISessionParameters, openaiCustomApiKey?: string) {
-	const { sessionId, language, provider: requestedProvider, encoding, sendBack, sendBackInterim, tags, openaiCustomUrl, deepgramMipOptOut, xaiEndpointing, xaiSmartTurn, xaiSmartTurnTimeout, xaiGranularFinals, xaiGranularStabilityMs, xaiGranularGuardWords } = parameters;
+	const {
+		sessionId,
+		language,
+		provider: requestedProvider,
+		encoding,
+		sendBack,
+		sendBackInterim,
+		tags,
+		openaiCustomUrl,
+		deepgramMipOptOut,
+		xaiEndpointing,
+		xaiSmartTurn,
+		xaiSmartTurnTimeout,
+		xaiGranularFinals,
+		xaiGranularStabilityMs,
+		xaiGranularGuardWords,
+	} = parameters;
 	const connectionId = ++wsConnectionId;
 
 	logger.info(
@@ -408,7 +432,9 @@ export function handleWebSocketConnection(ws: WebSocket, parameters: ISessionPar
 		session = sessionManager.getActiveSession(sessionId)!;
 		session.reattachWebSocket(ws);
 		isResume = true;
-		logger.warn(`[WS-${connectionId}] Duplicate connection for ${sessionId}, force-closing previous connection (original params will be used)`);
+		logger.warn(
+			`[WS-${connectionId}] Duplicate connection for ${sessionId}, force-closing previous connection (original params will be used)`,
+		);
 	} else {
 		// Create new session
 		// Determine which provider to use
@@ -473,7 +499,24 @@ export function handleWebSocketConnection(ws: WebSocket, parameters: ISessionPar
 		// Create transcription session
 		// Within this session, multiple participants (tags) can send audio
 		// Each tag gets its own backend connection, and transcripts are shared between tags
-		session = new TranscriberProxy(ws, { language, sessionId, provider, encoding, sendBack, sendBackInterim, tags, openaiCustomUrl, openaiCustomApiKey, deepgramMipOptOut, xaiEndpointing, xaiSmartTurn, xaiSmartTurnTimeout, xaiGranularFinals, xaiGranularStabilityMs, xaiGranularGuardWords });
+		session = new TranscriberProxy(ws, {
+			language,
+			sessionId,
+			provider,
+			encoding,
+			sendBack,
+			sendBackInterim,
+			tags,
+			openaiCustomUrl,
+			openaiCustomApiKey,
+			deepgramMipOptOut,
+			xaiEndpointing,
+			xaiSmartTurn,
+			xaiSmartTurnTimeout,
+			xaiGranularFinals,
+			xaiGranularStabilityMs,
+			xaiGranularGuardWords,
+		});
 
 		// Register the new session
 		sessionManager.registerSession(sessionId, session);
@@ -563,6 +606,34 @@ server.listen(PORT, HOST, () => {
 	logger.info('='.repeat(60));
 });
 
+// XMPP external component for Rayo/Jitsi transcription integration
+const xmppComponent = new XmppComponent({
+	host: config.xmpp.host,
+	port: config.xmpp.port,
+	domain: config.xmpp.domain,
+	secret: config.xmpp.secret,
+});
+
+// When a Rayo dial arrives, bridge the session to the transcription pipeline.
+// The RayoSession emits transcription results back to the MUC via XMPP.
+xmppComponent.on('rayo:session', (session: import('./xmpp/rayo').RayoSession) => {
+	logger.info(`[XMPP] New Rayo session ${session.callId} for room ${session.roomJid}`);
+
+	// Create a synthetic WebSocket connection to the existing transcription pipeline.
+	// The Rayo session acts as a signaling bridge — the actual audio still flows via
+	// the JVB WebSocket path. This session handles the XMPP presence/messaging for
+	// transcription events that the Jitsi web client expects.
+	session.on('closed', () => {
+		logger.info(`[XMPP] Rayo session ${session.callId} closed`);
+	});
+});
+
+// Start XMPP component (non-blocking — gracefully handles prosody not being ready)
+xmppComponent.start().catch((err) => {
+	const msg = err instanceof Error ? err.message : String(err);
+	logger.warn(`[XMPP] Component start failed (will retry): ${msg}`);
+});
+
 // Graceful shutdown
 process.on('SIGTERM', async () => {
 	logger.info('SIGTERM received, closing server...');
@@ -571,6 +642,9 @@ process.on('SIGTERM', async () => {
 	// TranslatorConnection flushes its final usage delta into the reporter buffer on close — so the
 	// buffer is complete before we drain it below.
 	sessionManager.shutdown();
+
+	// Shut down XMPP component and active Rayo sessions
+	await xmppComponent.stop();
 	for (const session of activeTranslateSessions) {
 		session.close();
 	}

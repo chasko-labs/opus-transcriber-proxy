@@ -21,7 +21,10 @@ function parseJsonOrDefault<T>(value: string | undefined, defaultValue: T): T {
 
 function parseAndValidateTags(value: string | undefined): string[] {
 	if (!value) return [];
-	const tags = value.split(',').map((t) => t.trim()).filter((t) => t);
+	const tags = value
+		.split(',')
+		.map((t) => t.trim())
+		.filter((t) => t);
 	validateTags(tags);
 	return tags;
 }
@@ -170,6 +173,14 @@ export const config = {
 		// Custom headers for authentication (e.g., CF Zero Trust, API keys)
 		headers: parseJsonOrDefault<Record<string, string>>(process.env.OTLP_HEADERS, {}),
 	},
+
+	// XMPP external component (XEP-0114) configuration for Rayo/Jitsi integration
+	xmpp: {
+		host: process.env.XMPP_COMPONENT_HOST || 'localhost',
+		port: parseIntOrDefault(process.env.XMPP_COMPONENT_PORT, 5347),
+		domain: process.env.XMPP_COMPONENT_DOMAIN || 'jitsi_meet_transcribe',
+		secret: process.env.XMPP_COMPONENT_SECRET || '',
+	},
 } as const;
 
 /**
@@ -219,5 +230,12 @@ export function getDefaultProvider(): Provider | null {
  * Validate that a provider name is valid
  */
 export function isValidProvider(provider: string): provider is Provider {
-	return provider === 'openai' || provider === 'openai_custom' || provider === 'gemini' || provider === 'deepgram' || provider === 'xai' || provider === 'dummy';
+	return (
+		provider === 'openai' ||
+		provider === 'openai_custom' ||
+		provider === 'gemini' ||
+		provider === 'deepgram' ||
+		provider === 'xai' ||
+		provider === 'dummy'
+	);
 }

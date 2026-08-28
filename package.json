@@ -40,6 +40,9 @@
 		"@opentelemetry/sdk-metrics": "^1.30.0",
 		"@opentelemetry/semantic-conventions": "^1.28.0",
 		"@opentelemetry/winston-transport": "^0.8.0",
+		"@xmpp/component": "^0.14.0",
+		"@xmpp/jid": "^0.14.0",
+		"@xmpp/xml": "^0.14.0",
 		"dotenv": "^16.4.5",
 		"winston": "^3.19.0",
 		"ws": "^8.18.0"

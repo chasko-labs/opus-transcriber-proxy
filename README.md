@@ -10,6 +10,7 @@ Real-time WebSocket transcription proxy supporting multiple speech-to-text backe
 - **Real-time streaming** - Interim and final transcription results
 - **Flexible deployment** - Node.js standalone or Cloudflare Workers with Containers
 - **Dispatcher integration** - Forward transcriptions to external services
+- **XMPP Rayo integration** - Native Jitsi transcription via XEP-0114 component protocol
 - **Audio debugging** - Dump and replay WebSocket sessions
 
 ## Quick Start
@@ -32,11 +33,13 @@ npm run dev
 ```
 
 Connect via WebSocket:
+
 ```
 ws://localhost:8080/transcribe?sessionId=test&sendBack=true
 ```
 
 With tags (for provider-specific features like Deepgram tagging):
+
 ```
 ws://localhost:8080/transcribe?sessionId=test&sendBack=true&tag=production&tag=region-us
 ```
@@ -74,84 +77,110 @@ Set environment variables or use a `.env` file:
 
 ### Provider Selection
 
-| Variable | Default | Description |
-|----------|---------|-------------|
+| Variable             | Default                  | Description             |
+| -------------------- | ------------------------ | ----------------------- |
 | `PROVIDERS_PRIORITY` | `openai,deepgram,gemini` | Provider priority order |
 
 ### API Keys
 
-| Variable | Description |
-|----------|-------------|
-| `OPENAI_API_KEY` | OpenAI API key |
-| `DEEPGRAM_API_KEY` | Deepgram API key |
-| `GEMINI_API_KEY` | Google Gemini API key |
-| `XAI_API_KEY` | xAI API key |
+| Variable           | Description           |
+| ------------------ | --------------------- |
+| `OPENAI_API_KEY`   | OpenAI API key        |
+| `DEEPGRAM_API_KEY` | Deepgram API key      |
+| `GEMINI_API_KEY`   | Google Gemini API key |
+| `XAI_API_KEY`      | xAI API key           |
 
 ### Provider Options
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `OPENAI_MODEL` | `gpt-4o-mini-transcribe` | OpenAI model |
-| `DEEPGRAM_MODEL` | `nova-2` | Deepgram model |
-| `DEEPGRAM_LANGUAGE` | `multi` | Language code or `multi` for auto |
-| `DEEPGRAM_ENCODING` | `opus` | `opus` (pass raw Opus/Ogg through) or `linear16` (decode to PCM) |
-| `DEEPGRAM_MIP_OPT_OUT` | `false` | `true` opts out of Deepgram's Model Improvement Program (adds `mip_opt_out=true`). Overridable per-connection via the `deepgram_mip_opt_out` URL query param. See https://dpgr.am/deepgram-mip |
-| `GEMINI_MODEL` | `gemini-2.0-flash-exp` | Gemini model |
-| `XAI_LANGUAGE` | (auto) | Language code (e.g. `en`, `fr`); omit for auto-detect |
-| `XAI_DIARIZE` | `false` | Enable speaker diarization |
-| `XAI_INCLUDE_LANGUAGE` | `false` | Append detected language to transcript text (e.g. `Hello [English]`) |
-| `XAI_SMART_TURN` | `0.5` | Turn-end confidence threshold (0.0–1.0) |
-| `XAI_SMART_TURN_TIMEOUT` | `500` | Max silence ms before forced turn end |
-| `XAI_GRANULAR_FINALS` | `false` | Roll-own granular finalization — commit a stable prefix incrementally instead of one final per turn (fixes long-turn-vs-acks ordering). Overridable per-connection via the `xai_granular_finals` URL query param |
-| `XAI_GRANULAR_STABILITY_MS` | `1000` | Debounce window: a word freezes after this many ms unchanged (per-connection: `xai_granular_stability_ms`) |
-| `XAI_GRANULAR_GUARD_WORDS` | `3` | Volatile words held back at the growing edge (per-connection: `xai_granular_guard_words`) |
-| `XAI_GRANULAR_MIN_WORDS` | `5` | Frozen words batched into segments of at least this size (or at a sentence end) |
-| `XAI_STT_URL` | `wss://api.x.ai/v1/stt` | Override STT endpoint |
+| Variable                    | Default                  | Description                                                                                                                                                                                                      |
+| --------------------------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `OPENAI_MODEL`              | `gpt-4o-mini-transcribe` | OpenAI model                                                                                                                                                                                                     |
+| `DEEPGRAM_MODEL`            | `nova-2`                 | Deepgram model                                                                                                                                                                                                   |
+| `DEEPGRAM_LANGUAGE`         | `multi`                  | Language code or `multi` for auto                                                                                                                                                                                |
+| `DEEPGRAM_ENCODING`         | `opus`                   | `opus` (pass raw Opus/Ogg through) or `linear16` (decode to PCM)                                                                                                                                                 |
+| `DEEPGRAM_MIP_OPT_OUT`      | `false`                  | `true` opts out of Deepgram's Model Improvement Program (adds `mip_opt_out=true`). Overridable per-connection via the `deepgram_mip_opt_out` URL query param. See https://dpgr.am/deepgram-mip                   |
+| `GEMINI_MODEL`              | `gemini-2.0-flash-exp`   | Gemini model                                                                                                                                                                                                     |
+| `XAI_LANGUAGE`              | (auto)                   | Language code (e.g. `en`, `fr`); omit for auto-detect                                                                                                                                                            |
+| `XAI_DIARIZE`               | `false`                  | Enable speaker diarization                                                                                                                                                                                       |
+| `XAI_INCLUDE_LANGUAGE`      | `false`                  | Append detected language to transcript text (e.g. `Hello [English]`)                                                                                                                                             |
+| `XAI_SMART_TURN`            | `0.5`                    | Turn-end confidence threshold (0.0–1.0)                                                                                                                                                                          |
+| `XAI_SMART_TURN_TIMEOUT`    | `500`                    | Max silence ms before forced turn end                                                                                                                                                                            |
+| `XAI_GRANULAR_FINALS`       | `false`                  | Roll-own granular finalization — commit a stable prefix incrementally instead of one final per turn (fixes long-turn-vs-acks ordering). Overridable per-connection via the `xai_granular_finals` URL query param |
+| `XAI_GRANULAR_STABILITY_MS` | `1000`                   | Debounce window: a word freezes after this many ms unchanged (per-connection: `xai_granular_stability_ms`)                                                                                                       |
+| `XAI_GRANULAR_GUARD_WORDS`  | `3`                      | Volatile words held back at the growing edge (per-connection: `xai_granular_guard_words`)                                                                                                                        |
+| `XAI_GRANULAR_MIN_WORDS`    | `5`                      | Frozen words batched into segments of at least this size (or at a sentence end)                                                                                                                                  |
+| `XAI_STT_URL`               | `wss://api.x.ai/v1/stt`  | Override STT endpoint                                                                                                                                                                                            |
 
 ### Server
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | `8080` | Listen port |
-| `HOST` | `0.0.0.0` | Listen address |
-| `DEBUG` | `false` | Enable debug logging |
-| `FORCE_COMMIT_TIMEOUT` | `2` | Seconds before finalizing pending audio |
+| Variable               | Default   | Description                             |
+| ---------------------- | --------- | --------------------------------------- |
+| `PORT`                 | `8080`    | Listen port                             |
+| `HOST`                 | `0.0.0.0` | Listen address                          |
+| `DEBUG`                | `false`   | Enable debug logging                    |
+| `FORCE_COMMIT_TIMEOUT` | `2`       | Seconds before finalizing pending audio |
 
 ### Translation (`/translate`)
 
 Speech-to-speech translation via OpenAI's realtime translations endpoint (`gpt-realtime-translate`).
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ENABLE_TRANSLATE` | `true` | Enable the `/translate` endpoint (disabled → its WebSocket upgrade is rejected with 404) |
-| `TRANSLATE_TRANSCRIPTS` | `true` | Emit target-language transcripts (`false` → translated audio only) |
-| `OPENAI_TRANSLATION_MODEL` | `gpt-realtime-translate` | Speech-to-speech translation model |
-| `OPENAI_TRANSLATION_API_KEY` | (falls back to `OPENAI_API_KEY`) | Separate API key for translation |
-| `TRANSLATION_USAGE_URL` | (unset) | Endpoint that receives translated-audio duration usage reports; unset → usage reporting is a no-op |
-| `TRANSLATION_USAGE_REPORT_INTERVAL_MS` | `15000` | Interval between incremental usage reports for an open translation direction; `<= 0` reports only the final delta at close |
-| `TRANSLATION_TALK_SILENCE_TIMEOUT_MS` | `350` | Silence (ms past projected media playout) before a translated "talk" ends and a `sending=false` notification is emitted to clients. Must exceed the 100 ms RtpTimestamper gap threshold; `<= 0` disables end-of-talk detection — unsafe on the translations endpoint (which sends no boundary event), where a talk would then never end until the connection closes |
-| `SOURCE_IMAGE_TAG` | (unset) | Docker image tag the WASM Opus codec was sourced from. Set by the translate-Worker deploy (the only path that sets it in practice, since the codec is versioned independently of the worker code); the container leaves it unset because code and codec ship in one image. Whenever present in the environment it is surfaced as `sourceImageTag` in the `info` message so a code/WASM mismatch is visible against `gitHash`; not used at runtime |
+| Variable                               | Default                          | Description                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| -------------------------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ENABLE_TRANSLATE`                     | `true`                           | Enable the `/translate` endpoint (disabled → its WebSocket upgrade is rejected with 404)                                                                                                                                                                                                                                                                                                                                                          |
+| `TRANSLATE_TRANSCRIPTS`                | `true`                           | Emit target-language transcripts (`false` → translated audio only)                                                                                                                                                                                                                                                                                                                                                                                |
+| `OPENAI_TRANSLATION_MODEL`             | `gpt-realtime-translate`         | Speech-to-speech translation model                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `OPENAI_TRANSLATION_API_KEY`           | (falls back to `OPENAI_API_KEY`) | Separate API key for translation                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `TRANSLATION_USAGE_URL`                | (unset)                          | Endpoint that receives translated-audio duration usage reports; unset → usage reporting is a no-op                                                                                                                                                                                                                                                                                                                                                |
+| `TRANSLATION_USAGE_REPORT_INTERVAL_MS` | `15000`                          | Interval between incremental usage reports for an open translation direction; `<= 0` reports only the final delta at close                                                                                                                                                                                                                                                                                                                        |
+| `TRANSLATION_TALK_SILENCE_TIMEOUT_MS`  | `350`                            | Silence (ms past projected media playout) before a translated "talk" ends and a `sending=false` notification is emitted to clients. Must exceed the 100 ms RtpTimestamper gap threshold; `<= 0` disables end-of-talk detection — unsafe on the translations endpoint (which sends no boundary event), where a talk would then never end until the connection closes                                                                               |
+| `SOURCE_IMAGE_TAG`                     | (unset)                          | Docker image tag the WASM Opus codec was sourced from. Set by the translate-Worker deploy (the only path that sets it in practice, since the codec is versioned independently of the worker code); the container leaves it unset because code and codec ship in one image. Whenever present in the environment it is surfaced as `sourceImageTag` in the `info` message so a code/WASM mismatch is visible against `gitHash`; not used at runtime |
 
 ### Dispatcher (Optional)
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `USE_DISPATCHER` | `false` | Enable dispatcher forwarding |
-| `DISPATCHER_WS_URL` | (empty) | Dispatcher WebSocket URL |
-| `DISPATCHER_HEADERS` | `{}` | Auth headers (JSON) |
+| Variable             | Default | Description                  |
+| -------------------- | ------- | ---------------------------- |
+| `USE_DISPATCHER`     | `false` | Enable dispatcher forwarding |
+| `DISPATCHER_WS_URL`  | (empty) | Dispatcher WebSocket URL     |
+| `DISPATCHER_HEADERS` | `{}`    | Auth headers (JSON)          |
 
 See [DISPATCHER_INTEGRATION.md](DISPATCHER_INTEGRATION.md) for details.
 
 ### Observability (Optional)
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `OTLP_ENDPOINT` | (empty) | OTLP HTTP endpoint (disabled if empty) |
-| `OTLP_ENV` | (empty) | Environment label |
-| `OTLP_RESOURCE_ATTRIBUTES` | `{}` | Additional resource attributes (JSON) |
-| `OTLP_HEADERS` | `{}` | Auth headers (JSON) |
+| Variable                   | Default | Description                            |
+| -------------------------- | ------- | -------------------------------------- |
+| `OTLP_ENDPOINT`            | (empty) | OTLP HTTP endpoint (disabled if empty) |
+| `OTLP_ENV`                 | (empty) | Environment label                      |
+| `OTLP_RESOURCE_ATTRIBUTES` | `{}`    | Additional resource attributes (JSON)  |
+| `OTLP_HEADERS`             | `{}`    | Auth headers (JSON)                    |
 
 See [OBSERVABILITY.md](OBSERVABILITY.md) for available metrics, queries, and authentication.
+
+### XMPP Component / Rayo (Optional — Jitsi native transcription)
+
+When deployed as a sidecar alongside Prosody (e.g. in ECS Fargate), the proxy can
+register as an XMPP external component (XEP-0114) to handle Rayo dial requests from
+the Jitsi web client. This is the native integration path — no Jicofo WebSocket
+forwarding needed.
+
+| Variable                | Default                 | Description                               |
+| ----------------------- | ----------------------- | ----------------------------------------- |
+| `XMPP_COMPONENT_HOST`   | `localhost`             | Prosody component host                    |
+| `XMPP_COMPONENT_PORT`   | `5347`                  | Prosody component port                    |
+| `XMPP_COMPONENT_DOMAIN` | `jitsi_meet_transcribe` | Component JID (must match Prosody config) |
+| `XMPP_COMPONENT_SECRET` | (empty — disables XMPP) | Shared secret for component auth          |
+
+The XMPP component is disabled when `XMPP_COMPONENT_SECRET` is empty. Connection
+failures are non-fatal — the component retries every 5 seconds until Prosody is
+available. The existing WebSocket server on port 8080 continues to operate regardless
+of XMPP component state.
+
+**Prosody configuration** (add to prosody config):
+
+```lua
+Component "jitsi_meet_transcribe.meet.jitsi"
+    component_secret = "your-shared-secret"
+```
 
 ## WebSocket Protocol
 
@@ -163,63 +192,67 @@ ws://host:port/transcribe?sessionId=xxx&sendBack=true
 
 **Query Parameters:**
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `sessionId` | (required) | Session identifier |
-| `sendBack` | `false` | Return final transcriptions |
-| `sendBackInterim` | `false` | Return interim transcriptions |
-| `provider` | (auto) | Override provider selection |
-| `encoding` | `opus` | Audio encoding: `opus` or `ogg-opus` |
-| `lang` | (auto) | Language hint |
-| `tag` | (none) | Session tags (multiple values supported, max 128 chars each) |
+| Parameter         | Default    | Description                                                  |
+| ----------------- | ---------- | ------------------------------------------------------------ |
+| `sessionId`       | (required) | Session identifier                                           |
+| `sendBack`        | `false`    | Return final transcriptions                                  |
+| `sendBackInterim` | `false`    | Return interim transcriptions                                |
+| `provider`        | (auto)     | Override provider selection                                  |
+| `encoding`        | `opus`     | Audio encoding: `opus` or `ogg-opus`                         |
+| `lang`            | (auto)     | Language hint                                                |
+| `tag`             | (none)     | Session tags (multiple values supported, max 128 chars each) |
 
 ### Client Messages
 
 **Audio data:**
+
 ```json
 {
-  "event": "media",
-  "media": {
-    "tag": "participant-id",
-    "chunk": 0,
-    "timestamp": 1768341932,
-    "payload": "base64-encoded-audio"
-  }
+	"event": "media",
+	"media": {
+		"tag": "participant-id",
+		"chunk": 0,
+		"timestamp": 1768341932,
+		"payload": "base64-encoded-audio"
+	}
 }
 ```
 
 **Ping:**
+
 ```json
-{"event": "ping", "id": 123}
+{ "event": "ping", "id": 123 }
 ```
 
 ### Server Messages
 
 **Transcription result:**
+
 ```json
 {
-  "type": "transcription-result",
-  "is_interim": false,
-  "transcript": [{"text": "hello world", "confidence": 0.98}],
-  "participant": {"id": "participant-id"},
-  "timestamp": 1768341932000,
-  "language": "en"
+	"type": "transcription-result",
+	"is_interim": false,
+	"transcript": [{ "text": "hello world", "confidence": 0.98 }],
+	"participant": { "id": "participant-id" },
+	"timestamp": 1768341932000,
+	"language": "en"
 }
 ```
 
 **Pong:**
+
 ```json
-{"event": "pong", "id": 123}
+{ "event": "pong", "id": 123 }
 ```
 
 ## Supported Providers
 
-| Provider | Features |
-|----------|----------|
-| **OpenAI** | Server VAD, confidence scores, streaming |
-| **Deepgram** | Punctuation, diarization, code-switching, streaming |
-| **Gemini** | Multimodal, multilingual |
-| **xAI** | Smart turn detection, diarization, language auto-detect, streaming |
+| Provider     | Features                                                           |
+| ------------ | ------------------------------------------------------------------ |
+| **OpenAI**   | Server VAD, confidence scores, streaming                           |
+| **Deepgram** | Punctuation, diarization, code-switching, streaming                |
+| **Gemini**   | Multimodal, multilingual                                           |
+| **xAI**      | Smart turn detection, diarization, language auto-detect, streaming |
 
 See [BACKENDS.md](BACKENDS.md) for detailed comparison and configuration.
 
