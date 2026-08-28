@@ -21,6 +21,13 @@ RUN apk add --no-cache python3 make g++ git
 COPY package.json package-lock.json* ./
 RUN npm ci
 
+# Fix: @xmpp/sasl-scram-sha-1 v0.13.x sends a malformed initial-response that
+# Prosody 13.0.6 rejects with "malformed-request". Reorder SASL mechanisms to
+# try PLAIN first, which Prosody handles correctly for internal auth.
+RUN sed -i 's/scramsha1,/PLACEHOLDER_FIRST,/' node_modules/@xmpp/client/index.js && \
+    sed -i 's/plain,/scramsha1,/' node_modules/@xmpp/client/index.js && \
+    sed -i 's/PLACEHOLDER_FIRST,/plain,/' node_modules/@xmpp/client/index.js
+
 # Sources required to compile libopus + the addon and to bundle the server.
 # src/ carries the libopus submodule (src/OpusDecoder/opus) that node-gyp builds.
 COPY binding.gyp build.mjs ./
@@ -46,6 +53,14 @@ RUN apk add --no-cache libstdc++
 # (binding.gyp is intentionally not present in this stage).
 COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev --ignore-scripts
+
+# Fix: @xmpp/sasl-scram-sha-1 v0.13.x sends a malformed initial-response that
+# Prosody 13.0.6 rejects with "malformed-request". Reorder SASL mechanisms to
+# try PLAIN first. packages: 'external' in build.mjs means @xmpp/client is
+# loaded from runtime node_modules, not bundled.
+RUN sed -i 's/scramsha1,/PLACEHOLDER_FIRST,/' node_modules/@xmpp/client/index.js && \
+    sed -i 's/plain,/scramsha1,/' node_modules/@xmpp/client/index.js && \
+    sed -i 's/PLACEHOLDER_FIRST,/plain,/' node_modules/@xmpp/client/index.js
 
 # Native Opus addon + bundled entrypoints (proxy server + monitor), compiled in the builder stage.
 COPY --from=builder /usr/src/app/build/Release/opus_native.node ./build/Release/opus_native.node

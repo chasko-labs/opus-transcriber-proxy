@@ -180,6 +180,18 @@ export const config = {
 		// Custom headers for authentication (e.g., CF Zero Trust, API keys)
 		headers: parseJsonOrDefault<Record<string, string>>(process.env.OTLP_HEADERS, {}),
 	},
+
+	// XMPP connection for Jicofo brewery registration (jigasi-compatible presence)
+	xmpp: {
+		host: process.env.XMPP_SERVER || 'localhost',
+		port: parseIntOrDefault(process.env.XMPP_PORT, 5222),
+		domain: process.env.XMPP_DOMAIN || 'meet.jitsi',
+		authDomain: process.env.XMPP_AUTH_DOMAIN || 'auth.meet.jitsi',
+		internalMucDomain: process.env.XMPP_INTERNAL_MUC_DOMAIN || 'internal-muc.meet.jitsi',
+		username: process.env.JIGASI_XMPP_USER || 'jigasi',
+		password: process.env.JIGASI_XMPP_PASSWORD || '',
+		breweryRoom: process.env.JIGASI_BREWERY || 'jigasibrewery',
+	},
 } as const;
 
 /**

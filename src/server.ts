@@ -14,6 +14,7 @@ import { sessionManager } from './SessionManager';
 import { flushTranslationUsage } from './usage-reporter';
 import { initTelemetry, initTelemetryLogs, shutdownTelemetry, shutdownTelemetryLogs, isTelemetryEnabled } from './telemetry';
 import { getInstruments } from './telemetry/instruments';
+import { XmppClient } from './xmpp/client';
 
 // Initialize OpenTelemetry (must be before other initialization)
 initTelemetry();
@@ -490,6 +491,32 @@ export function handleWebSocketConnection(ws: WebSocket, parameters: ISessionPar
 	}
 }
 
+// Start XMPP client for Jicofo brewery registration (jigasi-compatible)
+const xmppClient = new XmppClient({
+	host: config.xmpp.host,
+	port: config.xmpp.port,
+	domain: config.xmpp.domain,
+	authDomain: config.xmpp.authDomain,
+	internalMucDomain: config.xmpp.internalMucDomain,
+	username: config.xmpp.username,
+	password: config.xmpp.password,
+	breweryRoom: config.xmpp.breweryRoom,
+});
+
+xmppClient.on('rayo:session', (session) => {
+	logger.info(`[XMPP] New Rayo session ${session.callId} for room ${session.roomJid}`);
+	session.on('closed', () => {
+		logger.info(`[XMPP] Rayo session ${session.callId} closed`);
+	});
+});
+
+// Only start XMPP if credentials are configured
+if (config.xmpp.password) {
+	xmppClient.start();
+} else {
+	logger.warn('[XMPP] JIGASI_XMPP_PASSWORD not set — XMPP brewery registration disabled');
+}
+
 // Start server
 const PORT = config.server.port;
 const HOST = config.server.host;
@@ -566,6 +593,9 @@ server.listen(PORT, HOST, () => {
 // Graceful shutdown
 process.on('SIGTERM', async () => {
 	logger.info('SIGTERM received, closing server...');
+
+	// Stop XMPP client (leaves brewery, closes rayo sessions)
+	await xmppClient.stop();
 
 	// Shut down transcription sessions (SessionManager) and close active translation proxies — each
 	// TranslatorConnection flushes its final usage delta into the reporter buffer on close — so the
