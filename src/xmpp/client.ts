@@ -67,6 +67,16 @@ export class XmppClient extends EventEmitter {
 			this.fullJid = address.toString();
 			this.connected = true;
 			logger.info(`[XMPP] Connected as ${this.fullJid}`);
+			// Send initial self-presence FIRST to establish this as a live c2s
+			// session. Without it, Prosody treats the bound resource as never
+			// having come online and closes the stream after ~5s — which showed
+			// up as a clean "Disconnected" every 5 seconds with no error.
+			try {
+				await this.xmpp.send(xml('presence', {}));
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				logger.warn(`[XMPP] Initial presence failed: ${msg}`);
+			}
 			await this.joinBrewery();
 			this.startPingInterval();
 		});
