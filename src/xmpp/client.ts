@@ -23,6 +23,12 @@ export class XmppClient extends EventEmitter {
 	private pingInterval: ReturnType<typeof setInterval> | null = null;
 	private stopping = false;
 	private fullJid: string | null = null;
+	// Stable resource for the lifetime of the process. Reconnects reuse the SAME
+	// resource so the brewery presence is REPLACED, not duplicated. A new
+	// otp-<timestamp> per reconnect left ghost jigasi instances in the brewery
+	// that Jicofo then routed transcription requests to — those dead instances
+	// never answered, producing "Transcribing failed".
+	private readonly resource = `otp-${process.pid}-${Date.now()}`;
 	public sessions: Map<string, RayoSession> = new Map();
 
 	constructor(xmppConfig: XmppConfig) {
@@ -33,15 +39,26 @@ export class XmppClient extends EventEmitter {
 	async start(): Promise<void> {
 		this.stopping = false;
 
-		const resource = `otp-${Date.now()}`;
-		const jidStr = `${this.config.username}@${this.config.authDomain}/${resource}`;
+		// Tear down any prior client before creating a new one. Without this,
+		// a reconnect leaks the previous @xmpp/client (and its socket), and the
+		// old brewery presence is never cleaned up.
+		if (this.xmpp) {
+			try {
+				await this.xmpp.stop();
+			} catch {
+				// ignore — best-effort teardown of the stale client
+			}
+			this.xmpp = null;
+		}
+
+		const jidStr = `${this.config.username}@${this.config.authDomain}/${this.resource}`;
 
 		logger.info(`[XMPP] Connecting as ${jidStr} to ${this.config.host}:${this.config.port}`);
 
 		this.xmpp = client({
 			service: `xmpp://${this.config.host}:${this.config.port}`,
 			domain: this.config.authDomain,
-			resource,
+			resource: this.resource,
 			username: this.config.username,
 			password: this.config.password,
 		});
@@ -106,9 +123,9 @@ export class XmppClient extends EventEmitter {
 			'presence',
 			{ to, xmlns: 'jabber:client' },
 			xml('x', { xmlns: 'http://jabber.org/protocol/muc' }),
-			// FIXED: Use "stats" element with <stat> children — this is what
-			// Jicofo's BaseBrewery.java actually parses from MUC occupant presence.
-			xml('stats', { xmlns: 'http://jitsi.org/protocol/colibri' },
+			xml(
+				'stats',
+				{ xmlns: 'http://jitsi.org/protocol/colibri' },
 				xml('stat', { name: 'location', value: process.env.AWS_REGION || 'us-west-2' }),
 				xml('stat', { name: 'version', value: 'opus-transcriber-proxy' }),
 			),
@@ -133,7 +150,9 @@ export class XmppClient extends EventEmitter {
 		const presence = xml(
 			'presence',
 			{ to, xmlns: 'jabber:client' },
-			xml('stats', { xmlns: 'http://jitsi.org/protocol/colibri' },
+			xml(
+				'stats',
+				{ xmlns: 'http://jitsi.org/protocol/colibri' },
 				xml('stat', { name: 'location', value: process.env.AWS_REGION || 'us-west-2' }),
 				xml('stat', { name: 'version', value: 'opus-transcriber-proxy' }),
 			),
@@ -173,9 +192,14 @@ export class XmppClient extends EventEmitter {
 		this.pingInterval = setInterval(async () => {
 			if (!this.xmpp || !this.connected) return;
 			try {
+				// Ping the server we are actually connected to (authDomain), not
+				// the muc/app domain. Pinging meet.jitsi from an auth.meet.jitsi
+				// connection got no reply, so the connection was declared dead
+				// every ~5 min (connection-timeout), forcing a reconnect and a
+				// fresh brewery presence.
 				const pingIq = xml(
 					'iq',
-					{ type: 'get', to: this.config.domain, id: `ping-${Date.now()}` },
+					{ type: 'get', to: this.config.authDomain, id: `ping-${Date.now()}` },
 					xml('ping', { xmlns: 'urn:xmpp:ping' }),
 				);
 				await this.xmpp.send(pingIq);
@@ -268,9 +292,7 @@ export class XmppClient extends EventEmitter {
 			const errorReply = xml(
 				'iq',
 				{ type: 'error', to: from, id },
-				xml('error', { type: 'cancel' },
-					xml('feature-not-implemented', { xmlns: 'urn:ietf:params:xml:ns:xmpp-stanzas' }),
-				),
+				xml('error', { type: 'cancel' }, xml('feature-not-implemented', { xmlns: 'urn:ietf:params:xml:ns:xmpp-stanzas' })),
 			);
 			this.xmpp?.send(errorReply).catch(() => {});
 		}
