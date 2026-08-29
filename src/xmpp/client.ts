@@ -21,6 +21,10 @@ export class XmppClient extends EventEmitter {
 	private connected = false;
 	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 	private pingInterval: ReturnType<typeof setInterval> | null = null;
+	// Whitespace keepalive fires well below Prosody's ~5s c2s reap window.
+	// The 30s XEP-0199 IQ ping is far too slow — the socket died 6x before the
+	// first ping ever fired. This raw '\n' write keeps the c2s session hot.
+	private whitespaceTimer: ReturnType<typeof setInterval> | null = null;
 	private stopping = false;
 	private fullJid: string | null = null;
 	// Stable resource for the lifetime of the process. Reconnects reuse the SAME
@@ -39,16 +43,16 @@ export class XmppClient extends EventEmitter {
 	async start(): Promise<void> {
 		this.stopping = false;
 
-		// Tear down any prior client before creating a new one. Without this,
-		// a reconnect leaks the previous @xmpp/client (and its socket), and the
-		// old brewery presence is never cleaned up.
+		// SINGLE RECONNECT OWNER: @xmpp/client auto-loads @xmpp/reconnect, which
+		// re-opens the stream on the SAME entity when it emits 'disconnect'. We
+		// build the client exactly ONCE here and never tear it down on reconnect.
+		// The previous code called this.xmpp.stop() at the top of every start(),
+		// which raced the built-in reconnect (two lifecycle managers fighting)
+		// and leaked sockets. If start() is somehow re-entered while a client
+		// already exists, leave the existing one alone — reconnect owns it.
 		if (this.xmpp) {
-			try {
-				await this.xmpp.stop();
-			} catch {
-				// ignore — best-effort teardown of the stale client
-			}
-			this.xmpp = null;
+			logger.warn('[XMPP] start() called with an existing client; built-in reconnect owns the lifecycle, skipping rebuild');
+			return;
 		}
 
 		const jidStr = `${this.config.username}@${this.config.authDomain}/${this.resource}`;
@@ -67,6 +71,23 @@ export class XmppClient extends EventEmitter {
 			this.fullJid = address.toString();
 			this.connected = true;
 			logger.info(`[XMPP] Connected as ${this.fullJid}`);
+			// OBSERVABILITY: report whether stream management (XEP-0198 smacks)
+			// negotiated. @xmpp/client auto-sends <enable/> but swallows failure
+			// silently — if Prosody's mod_smacks is not advertised there is no
+			// smacks acking AND no whitespace keepalive from the plugin, which is
+			// a prime suspect for the ~5s socket reap. On 0.13.6 the state lives
+			// at this.xmpp.streamManagement.enabled.
+			try {
+				const sm = (this.xmpp as { streamManagement?: { enabled?: boolean } }).streamManagement;
+				if (sm && typeof sm.enabled === 'boolean') {
+					logger.info(`[XMPP] stream-management enabled=${sm.enabled}`);
+				} else {
+					logger.info('[XMPP] stream-management enabled=unknown (streamManagement.enabled not readable in @xmpp/client 0.13.6)');
+				}
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				logger.info(`[XMPP] stream-management enabled=unknown (read failed: ${msg})`);
+			}
 			// Send initial self-presence FIRST to establish this as a live c2s
 			// session. Without it, Prosody treats the bound resource as never
 			// having come online and closes the stream after ~5s — which showed
@@ -86,9 +107,11 @@ export class XmppClient extends EventEmitter {
 			this.fullJid = null;
 			this.stopPingInterval();
 			logger.info('[XMPP] Disconnected');
-			if (!this.stopping) {
-				this.scheduleReconnect();
-			}
+			// NO app-level reconnect here. @xmpp/client's built-in @xmpp/reconnect
+			// listens for the same 'disconnect' and re-opens the stream on this
+			// entity, re-emitting 'online' (which re-sends presence + rejoins the
+			// brewery — the 'online' handler is idempotent). A second reconnect
+			// path here would race it and leak sockets.
 		});
 
 		this.xmpp.on('error', (err: Error) => {
@@ -104,6 +127,17 @@ export class XmppClient extends EventEmitter {
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
 			logger.error(`[XMPP] Failed to start: ${msg}`);
+			// INITIAL-CONNECT failure only. Built-in @xmpp/reconnect does NOT retry
+			// a connection that never came online (it only fires on 'disconnect'
+			// after a prior success), so this fallback covers the disjoint case of
+			// Prosody not being reachable at boot. Null the client so the retry can
+			// rebuild cleanly past the start() "existing client" guard.
+			try {
+				await this.xmpp.stop();
+			} catch {
+				// ignore — the start already failed
+			}
+			this.xmpp = null;
 			this.scheduleReconnect();
 		}
 	}
@@ -194,11 +228,47 @@ export class XmppClient extends EventEmitter {
 	}
 
 	/**
-	 * XEP-0199 XMPP Ping keepalive — sends a ping IQ to the server every 30 seconds
-	 * to prevent the connection from being dropped due to inactivity.
+	 * Keepalive. Two timers:
+	 *  - 3s whitespace ping: a single raw '\n' written to the socket. This fires
+	 *    strictly below Prosody's ~5s c2s reap window and is what actually keeps
+	 *    the session alive. The prior 30s XEP-0199 IQ ping was far too slow — the
+	 *    socket was reaped ~6x before the first IQ ping ever fired.
+	 *  - 30s XEP-0199 ping IQ: retained as a higher-level liveness check that also
+	 *    detects a half-open connection (no reply => something is wrong).
 	 */
 	private startPingInterval(): void {
 		this.stopPingInterval();
+
+		// 3s raw whitespace keepalive — below the ~5s teardown.
+		this.whitespaceTimer = setInterval(() => {
+			if (!this.connected) return;
+			try {
+				// @xmpp/client 0.13.x exposes the live connection socket on the
+				// entity (@xmpp/connection sets this.socket and offers a raw
+				// write()). A lone newline is ignorable XML stream whitespace per
+				// RFC 6120 and resets Prosody's inactivity timer.
+				const sock = (this.xmpp as { socket?: { write?: (s: string, cb?: (err?: Error) => void) => void } }).socket;
+				if (sock?.write) {
+					sock.write('\n', (err?: Error) => {
+						if (err) {
+							logger.warn(`[XMPP] Whitespace keepalive write failed: ${err.message}`);
+						}
+					});
+				} else {
+					// No raw socket write exposed — fall back to a no-op presence
+					// probe to the server we are bound to. Prosody ignores a bare
+					// self-presence beyond refreshing session liveness.
+					this.xmpp?.send(xml('presence', {})).catch((err: unknown) => {
+						const msg = err instanceof Error ? err.message : String(err);
+						logger.warn(`[XMPP] Whitespace-fallback presence failed: ${msg}`);
+					});
+				}
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				logger.warn(`[XMPP] Whitespace keepalive error: ${msg}`);
+			}
+		}, 3_000);
+
 		this.pingInterval = setInterval(async () => {
 			if (!this.xmpp || !this.connected) return;
 			try {
@@ -225,6 +295,10 @@ export class XmppClient extends EventEmitter {
 		if (this.pingInterval) {
 			clearInterval(this.pingInterval);
 			this.pingInterval = null;
+		}
+		if (this.whitespaceTimer) {
+			clearInterval(this.whitespaceTimer);
+			this.whitespaceTimer = null;
 		}
 	}
 
