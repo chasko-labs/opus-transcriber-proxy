@@ -135,6 +135,21 @@ export const config = {
 		sampleRate: parseIntOrDefault(process.env.AWS_TRANSCRIBE_SAMPLE_RATE, 16000),
 	},
 
+	// Amazon Translate configuration (additive text captions on the /transcribe path).
+	// When enableTranslationCaptions is true, each FINAL Transcribe result is also
+	// translated to the other supported language (en<->es) and emitted as a second
+	// transcription-result frame. Authenticates via the default AWS credential chain
+	// (task role grants translate:TranslateText) — no API key. Off by default so the
+	// image is safe to deploy without changing transcription behaviour; flip it on via
+	// ENABLE_TRANSLATION_CAPTIONS=true in the task-def env when ready.
+	awsTranslate: {
+		// Region precedence mirrors awsTranscribe: AWS_TRANSLATE_REGION, then AWS_REGION,
+		// then us-west-2.
+		region: process.env.AWS_TRANSLATE_REGION || process.env.AWS_REGION || 'us-west-2',
+		// Master switch for the additive translated-caption frame. Default false.
+		enableTranslationCaptions: process.env.ENABLE_TRANSLATION_CAPTIONS === 'true',
+	},
+
 	// Deepgram configuration
 	deepgram: {
 		apiKey: process.env.DEEPGRAM_API_KEY || '',
