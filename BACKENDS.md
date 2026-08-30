@@ -207,6 +207,59 @@ PROVIDERS_PRIORITY=xai,openai,deepgram,gemini
 - **Granular finalization (`XAI_GRANULAR_FINALS`, default OFF):** by default xAI emits one final per turn (only on end-of-turn `speech_final`, which re-emits the whole turn), so a long turn lands in the stored transcript after other speakers' short acks. When enabled, `XAIGranularSegmenter` reconstructs xAI's growing hypothesis from the interim stream and commits a **stable prefix** once it's been unchanged for `XAI_GRANULAR_STABILITY_MS` (default 1000), holding back `XAI_GRANULAR_GUARD_WORDS` (default 3) volatile words, batched into `XAI_GRANULAR_MIN_WORDS` (default 5)-word segments emitted as finals — so the long turn interleaves in order (Deepgram-style: the in-progress remainder is emitted as an interim). The end-of-turn `speech_final` is **reconciled** (only the uncommitted trailing remainder is flushed from its authoritative text — the whole-turn re-emit is never reprinted; reconciliation only appends). A non-empty `transcript.done` is deduped via `hasActiveTurn()`. Scoped to the **non-diarized** path; `forceCommit()` DTX silence-injection and the stream-timeout reconnect are unchanged. Flag + stability/guard knobs are per-connection overridable (`xai_granular_finals`/`xai_granular_stability_ms`/`xai_granular_guard_words`); `min_words` is global-only (`XAI_GRANULAR_MIN_WORDS`, a batching detail, not a correctness knob). Defaults tuned live (0 word-edits, first commit ~2.9s vs ~29s before); see `unreal-agents/experiments/xai-vs-deepgram-finalization/TUNING.md`
 - No model selection for the STT endpoint (model is inherent to the service)
 
+### Amazon Transcribe Streaming
+
+Uses AWS Transcribe Streaming (`StartStreamTranscription`) for real-time transcription. Authenticates via the default AWS credential chain — no API key. Intended for AWS deployments where an ECS task role or instance profile supplies credentials.
+
+**Features:**
+
+- Bidirectional streaming over the AWS SDK's event stream
+- Interim (partial) and final transcriptions
+- Bilingual auto-detect via multi-language identification (default `en-US,es-US`)
+- Optional fixed language when auto-detect is undesirable
+- Per-word confidence, averaged onto each emitted message
+- One stream per participant
+- No API key — IAM-role credentials only
+
+**Configuration:**
+
+```bash
+# Region for both the Transcribe endpoint and the credential resolution.
+# Falls back to AWS_REGION, then us-west-2. Setting one of these also opts the
+# provider in to getAvailableProviders / PROVIDERS_PRIORITY.
+AWS_TRANSCRIBE_REGION=us-west-2
+
+# Candidate languages for auto-detect (comma-separated). Used only when no fixed
+# language is in effect. en-US,es-US covers a bilingual EN/ES room.
+AWS_TRANSCRIBE_LANGUAGE_OPTIONS=en-US,es-US
+
+# Optional fixed language. When set (or when a connection supplies ?language=),
+# Transcribe runs single-language and auto-detect is disabled. Empty = auto-detect.
+AWS_TRANSCRIBE_LANGUAGE=
+
+# PCM sample rate fed to Transcribe (8000 or 16000). 16000 is correct for
+# meeting audio; the proxy decoder resamples its l16@24000 default down to this.
+AWS_TRANSCRIBE_SAMPLE_RATE=16000
+
+# Make Amazon Transcribe the default provider
+PROVIDERS_PRIORITY=aws_transcribe,deepgram,openai
+```
+
+**IAM permissions:** the task/instance role needs `transcribe:StartStreamTranscription`. No `translate:*` — this backend is transcription only. Translation, if needed, is a separate proxy path.
+
+**Technical Details:**
+
+- SDK: `@aws-sdk/client-transcribe-streaming` — `TranscribeStreamingClient` + `StartStreamTranscriptionCommand`
+- Audio: requests `l16` (PCM signed 16-bit little-endian) at `AWS_TRANSCRIBE_SAMPLE_RATE` (default 16000) via `getDesiredAudioFormat()`. The proxy's decoder produces PCM already at that rate — Opus is decoded straight to 16kHz, and the `l16@24000` default is resampled to 16kHz by the pipeline's `L16Decoder` — so the backend forwards bytes without any in-backend resample.
+- `AudioStream` is an async iterable of `{ AudioEvent: { AudioChunk } }`; an internal `AudioStreamSource` bridges the proxy's imperative `sendAudio()` pushes into that iterable.
+- Language selection precedence: per-connection `?language=` (BackendConfig.language) > global `AWS_TRANSCRIBE_LANGUAGE` (fixed `LanguageCode`) > `IdentifyMultipleLanguages` across `LanguageOptions`. A single-item `LanguageOptions` collapses to a fixed `LanguageCode`.
+- The detected language is set as the `language` property on each transcription event (`result.LanguageCode` when identifying).
+- `IsPartial=true` results become interim transcriptions; finals become complete transcriptions.
+- `forceCommit()` is best-effort: Transcribe finalizes on detected silence automatically (there is no flush verb), so it pushes a zero-length boundary chunk rather than forcing a commit.
+- `updatePrompt()` is a no-op — Transcribe Streaming has no prompt concept (use service-level custom vocabularies).
+- Errors are reported `recoverable: true` (connection failures and mid-stream errors), so `OutgoingConnection` reconnects the backend in place instead of tearing down the participant — matching the transient-timeout handling used by the xAI backend.
+- Generates a unique UUID per transcription message.
+
 ## Architecture
 
 ### Backend Interface

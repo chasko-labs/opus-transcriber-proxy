@@ -21,12 +21,15 @@ function parseJsonOrDefault<T>(value: string | undefined, defaultValue: T): T {
 
 function parseAndValidateTags(value: string | undefined): string[] {
 	if (!value) return [];
-	const tags = value.split(',').map((t) => t.trim()).filter((t) => t);
+	const tags = value
+		.split(',')
+		.map((t) => t.trim())
+		.filter((t) => t);
 	validateTags(tags);
 	return tags;
 }
 
-export type Provider = 'openai' | 'openai_custom' | 'gemini' | 'deepgram' | 'xai' | 'dummy';
+export type Provider = 'openai' | 'openai_custom' | 'gemini' | 'deepgram' | 'xai' | 'aws_transcribe' | 'dummy';
 
 export const config = {
 	// Provider priority list (comma-separated, first available is default)
@@ -101,6 +104,35 @@ export const config = {
 		granularStabilityMs: parseIntOrDefault(process.env.XAI_GRANULAR_STABILITY_MS, 1000),
 		granularGuardWords: parseIntOrDefault(process.env.XAI_GRANULAR_GUARD_WORDS, 3),
 		granularMinWords: parseIntOrDefault(process.env.XAI_GRANULAR_MIN_WORDS, 5),
+	},
+
+	// Amazon Transcribe Streaming configuration.
+	// Authenticates via the default AWS credential chain (ECS task role / instance
+	// profile / env credentials) — no API key. `region` is the only mandatory value.
+	//
+	// Language handling:
+	//  - default: IdentifyMultipleLanguages across `languageOptions` (bilingual auto-detect)
+	//  - set AWS_TRANSCRIBE_LANGUAGE to a fixed code (e.g. en-US) to disable auto-detect
+	//    globally; a per-connection BackendConfig.language overrides both.
+	awsTranscribe: {
+		region: process.env.AWS_TRANSCRIBE_REGION || process.env.AWS_REGION || 'us-west-2',
+		// Explicit opt-in: the provider is only "available" (eligible as a default via
+		// PROVIDERS_PRIORITY / getAvailableProviders) when a region was actually set in
+		// the environment. The us-west-2 default above is a runtime fallback for the
+		// client, not a signal that the operator intends to use Transcribe.
+		configured: !!(process.env.AWS_TRANSCRIBE_REGION || process.env.AWS_REGION),
+		// Comma-separated candidate languages for auto-detect. en-US,es-US covers the
+		// bilingual workshop case. Only used when no fixed language is in effect.
+		languageOptions: process.env.AWS_TRANSCRIBE_LANGUAGE_OPTIONS || 'en-US,es-US',
+		// Optional fixed language code. When set (or when a connection supplies
+		// BackendConfig.language), Transcribe runs with a single LanguageCode and
+		// auto-detect is disabled. Empty string = auto-detect via languageOptions.
+		language: process.env.AWS_TRANSCRIBE_LANGUAGE || '',
+		// PCM sample rate fed to Transcribe. Transcribe Streaming accepts 8000 or 16000
+		// for wideband PCM; 16000 is the correct rate for VoIP-grade meeting audio.
+		// getDesiredAudioFormat() requests l16 at this rate so the proxy's decoder
+		// delivers PCM already at the target rate (no in-backend resample needed).
+		sampleRate: parseIntOrDefault(process.env.AWS_TRANSCRIBE_SAMPLE_RATE, 16000),
 	},
 
 	// Deepgram configuration
@@ -187,6 +219,11 @@ export function isProviderAvailable(provider: Provider): boolean {
 			return !!config.deepgram.apiKey;
 		case 'xai':
 			return !!config.xai.apiKey;
+		case 'aws_transcribe':
+			// Uses the default AWS credential chain (no API key). Available only when a
+			// region was explicitly configured (AWS_TRANSCRIBE_REGION or AWS_REGION), so
+			// it is never a silent default on a box that merely runs on AWS.
+			return config.awsTranscribe.configured;
 		case 'dummy':
 			return config.enableDummyProvider; // Dummy only available if explicitly enabled
 		default:
@@ -198,7 +235,7 @@ export function isProviderAvailable(provider: Provider): boolean {
  * Get all available providers
  */
 export function getAvailableProviders(): Provider[] {
-	const allProviders: Provider[] = ['openai', 'openai_custom', 'gemini', 'deepgram', 'xai', 'dummy'];
+	const allProviders: Provider[] = ['openai', 'openai_custom', 'gemini', 'deepgram', 'xai', 'aws_transcribe', 'dummy'];
 	return allProviders.filter(isProviderAvailable);
 }
 
@@ -219,5 +256,13 @@ export function getDefaultProvider(): Provider | null {
  * Validate that a provider name is valid
  */
 export function isValidProvider(provider: string): provider is Provider {
-	return provider === 'openai' || provider === 'openai_custom' || provider === 'gemini' || provider === 'deepgram' || provider === 'xai' || provider === 'dummy';
+	return (
+		provider === 'openai' ||
+		provider === 'openai_custom' ||
+		provider === 'gemini' ||
+		provider === 'deepgram' ||
+		provider === 'xai' ||
+		provider === 'aws_transcribe' ||
+		provider === 'dummy'
+	);
 }

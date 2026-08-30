@@ -40,6 +40,11 @@ describe('config', () => {
 		delete process.env.DEEPGRAM_DIARIZE;
 		delete process.env.GEMINI_MODEL;
 		delete process.env.GEMINI_TRANSCRIPTION_PROMPT;
+		// Amazon Transcribe is gated on an explicit region; clear both so the
+		// "no providers configured" cases are not affected by an AWS_REGION set in
+		// the surrounding shell (common on AWS hosts / CI).
+		delete process.env.AWS_TRANSCRIBE_REGION;
+		delete process.env.AWS_REGION;
 	});
 
 	// Restore original env after all tests
