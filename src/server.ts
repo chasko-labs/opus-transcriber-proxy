@@ -3,10 +3,18 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { config, getAvailableProviders, getDefaultProvider, isValidProvider, isProviderAvailable, type Provider } from './config';
 import { extractSessionParameters, type ISessionParameters } from './utils';
 import { TranscriberProxy, type TranscriptionMessage } from './transcriberproxy';
+import { AWSTranslateText, buildTranslationCaption } from './backends/AWSTranslateText';
 import { TranslatorProxy } from './translatorproxy';
 import { normalizeTargetLanguage } from './TranslatorConnection';
 import { createNodeTranslationRuntime } from './translate/nodeRuntime';
-import { buildTranslationMediaMessage, buildTranslationTalkStartMessage, buildTranslationTalkStopMessage, buildTranslationTranscriptMessage, type TranslationTalkStartData, type TranslationTalkStopData } from './translate/messages';
+import {
+	buildTranslationMediaMessage,
+	buildTranslationTalkStartMessage,
+	buildTranslationTalkStopMessage,
+	buildTranslationTranscriptMessage,
+	type TranslationTalkStartData,
+	type TranslationTalkStopData,
+} from './translate/messages';
 import type { IWebSocket } from './translate/runtime';
 import { setMetricDebug, writeMetric } from './metrics';
 import logger, { addOtlpTransport } from './logger';
@@ -22,6 +30,18 @@ addOtlpTransport(isTelemetryEnabled());
 
 // Initialize metric debug logging
 setMetricDebug(config.debug);
+
+// Lazily-created Amazon Translate client for additive translated captions on the
+// /transcribe path. Only constructed when ENABLE_TRANSLATION_CAPTIONS is true, so
+// deployments that leave the feature off never build a Translate client. Shared
+// across sessions — TranslateTextCommand is stateless per-request.
+let translationCaptioner: AWSTranslateText | undefined;
+function getTranslationCaptioner(): AWSTranslateText {
+	if (!translationCaptioner) {
+		translationCaptioner = new AWSTranslateText();
+	}
+	return translationCaptioner;
+}
 
 // Create HTTP server
 const server = http.createServer((req, res) => {
@@ -264,6 +284,39 @@ function setupSessionEventHandlers(ws: WebSocket, session: TranscriberProxy, con
 			} catch (error) {
 				logger.error(`[WS-${connectionId}] Failed to send final:`, error);
 			}
+
+			// Additive translated caption (issue #99): when enabled, translate this
+			// FINAL to the other supported language (en<->es) and emit a SECOND
+			// transcription-result frame tagged with the target language. Off by
+			// default (ENABLE_TRANSLATION_CAPTIONS). Failure here never affects the
+			// original caption already sent above — buildTranslationCaption swallows
+			// translate errors and returns undefined. Finals only; interims are not
+			// translated. Fire-and-forget so translate latency never blocks the
+			// original delivery path.
+			if (config.awsTranslate.enableTranslationCaptions) {
+				buildTranslationCaption(data, getTranslationCaptioner())
+					.then((translatedFrame) => {
+						if (!translatedFrame) return;
+						const ws2 = session.getWebSocket();
+						if (!ws2 || ws2.readyState !== 1) {
+							logger.warn(`[WS-${connectionId}] Cannot send translated caption: not open (readyState=${ws2?.readyState})`);
+							return;
+						}
+						try {
+							ws2.send(JSON.stringify(translatedFrame));
+							getInstruments().transcriptionsDeliveredTotal.add(1, {
+								provider: options.provider || 'unknown',
+								is_interim: 'false',
+							});
+							logger.debug(`[WS-${connectionId}] Sent translated caption (${translatedFrame.language})`);
+						} catch (error) {
+							logger.error(`[WS-${connectionId}] Failed to send translated caption:`, error);
+						}
+					})
+					.catch((error) => {
+						logger.error(`[WS-${connectionId}] Unexpected error building translated caption:`, error);
+					});
+			}
 		} else {
 			logger.warn(`[WS-${connectionId}] Not sending final: sendBack=${sendBack}`);
 		}
@@ -380,7 +433,23 @@ function handleTranslatorConnection(ws: WebSocket, parameters: ISessionParameter
 }
 
 export function handleWebSocketConnection(ws: WebSocket, parameters: ISessionParameters, openaiCustomApiKey?: string) {
-	const { sessionId, language, provider: requestedProvider, encoding, sendBack, sendBackInterim, tags, openaiCustomUrl, deepgramMipOptOut, xaiEndpointing, xaiSmartTurn, xaiSmartTurnTimeout, xaiGranularFinals, xaiGranularStabilityMs, xaiGranularGuardWords } = parameters;
+	const {
+		sessionId,
+		language,
+		provider: requestedProvider,
+		encoding,
+		sendBack,
+		sendBackInterim,
+		tags,
+		openaiCustomUrl,
+		deepgramMipOptOut,
+		xaiEndpointing,
+		xaiSmartTurn,
+		xaiSmartTurnTimeout,
+		xaiGranularFinals,
+		xaiGranularStabilityMs,
+		xaiGranularGuardWords,
+	} = parameters;
 	const connectionId = ++wsConnectionId;
 
 	logger.info(
@@ -408,7 +477,9 @@ export function handleWebSocketConnection(ws: WebSocket, parameters: ISessionPar
 		session = sessionManager.getActiveSession(sessionId)!;
 		session.reattachWebSocket(ws);
 		isResume = true;
-		logger.warn(`[WS-${connectionId}] Duplicate connection for ${sessionId}, force-closing previous connection (original params will be used)`);
+		logger.warn(
+			`[WS-${connectionId}] Duplicate connection for ${sessionId}, force-closing previous connection (original params will be used)`,
+		);
 	} else {
 		// Create new session
 		// Determine which provider to use
@@ -473,7 +544,24 @@ export function handleWebSocketConnection(ws: WebSocket, parameters: ISessionPar
 		// Create transcription session
 		// Within this session, multiple participants (tags) can send audio
 		// Each tag gets its own backend connection, and transcripts are shared between tags
-		session = new TranscriberProxy(ws, { language, sessionId, provider, encoding, sendBack, sendBackInterim, tags, openaiCustomUrl, openaiCustomApiKey, deepgramMipOptOut, xaiEndpointing, xaiSmartTurn, xaiSmartTurnTimeout, xaiGranularFinals, xaiGranularStabilityMs, xaiGranularGuardWords });
+		session = new TranscriberProxy(ws, {
+			language,
+			sessionId,
+			provider,
+			encoding,
+			sendBack,
+			sendBackInterim,
+			tags,
+			openaiCustomUrl,
+			openaiCustomApiKey,
+			deepgramMipOptOut,
+			xaiEndpointing,
+			xaiSmartTurn,
+			xaiSmartTurnTimeout,
+			xaiGranularFinals,
+			xaiGranularStabilityMs,
+			xaiGranularGuardWords,
+		});
 
 		// Register the new session
 		sessionManager.registerSession(sessionId, session);
