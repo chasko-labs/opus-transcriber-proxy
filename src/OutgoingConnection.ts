@@ -123,7 +123,10 @@ export class OutgoingConnection {
 				if (generation !== this.reinitGeneration) {
 					// A newer reinitializeDecoder call has already succeeded; don't
 					// tear down the connection that it set up.
-					logger.debug(`Stale reinitializeDecoder error for tag ${this.localTag} (superseded by generation ${this.reinitGeneration}):`, error);
+					logger.debug(
+						`Stale reinitializeDecoder error for tag ${this.localTag} (superseded by generation ${this.reinitGeneration}):`,
+						error,
+					);
 					return;
 				}
 				logger.error(`Failed to reinitialize decoder for tag ${this.localTag}:`, error);
@@ -275,7 +278,10 @@ export class OutgoingConnection {
 		// on every transcription in production.
 		if (!logger.isLevelEnabled('debug')) return;
 		const segments = message.transcript ?? [];
-		const text = segments.map((s) => s.text ?? '').join(' ').trim();
+		const text = segments
+			.map((s) => s.text ?? '')
+			.join(' ')
+			.trim();
 		const preview = text.length > 40 ? text.slice(0, 40) + '…' : text;
 		logger.debug(
 			`Backend ${isInterim ? 'interim' : 'final'} tag=${this.localTag} lang=${message.language ?? 'n/a'} segments=${segments.length} textLen=${text.length} preview=${JSON.stringify(preview)}`,
@@ -564,7 +570,17 @@ export class OutgoingConnection {
 	private sendOrEnqueueDecodedAudio(audioData: Uint8Array) {
 		const backendStatus = this.backend?.getStatus();
 
-		if (backendStatus === 'connected' && this.backend) {
+		// A backend may accept audio before it reaches 'connected'. The AWS
+		// Transcribe backend MUST: it opens a streaming request in connect() and
+		// the service only responds (resolving connect() -> status 'connected')
+		// once it has received audio, so withholding audio during 'pending'
+		// deadlocks it. Such a backend buffers pre-connected audio internally, so
+		// we hand frames straight over. WebSocket backends (Deepgram/xAI/OpenAI/
+		// Gemini) throw if fed before 'connected', so for them we keep queuing into
+		// pendingAudioFrames and flush once connected. See feat/aws-transcribe-deadlock-fix.
+		const acceptsPending = backendStatus === 'pending' && this.backend?.acceptsAudioBeforeConnected === true;
+
+		if ((backendStatus === 'connected' || acceptsPending) && this.backend) {
 			const encodedAudio = Buffer.from(audioData.buffer, audioData.byteOffset, audioData.byteLength).toString('base64');
 			this.sendAudioToBackend(encodedAudio);
 		} else if (backendStatus === 'pending') {
@@ -729,7 +745,8 @@ export class OutgoingConnection {
 			let fullPrompt = basePrompt;
 
 			if (this.transcriptHistory) {
-				fullPrompt += '\n\nThe following is a transcription of what others in the conference have recently said. Use it as context when transcribing.\n';
+				fullPrompt +=
+					'\n\nThe following is a transcription of what others in the conference have recently said. Use it as context when transcribing.\n';
 				fullPrompt += this.transcriptHistory;
 			}
 

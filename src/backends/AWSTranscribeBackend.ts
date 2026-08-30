@@ -38,6 +38,13 @@ import type { TranscriptionMessage } from '../transcriberproxy';
 type BackendStatus = 'pending' | 'connected' | 'failed' | 'closed';
 
 export class AWSTranscribeBackend implements TranscriptionBackend {
+	// Amazon Transcribe's StartStreamTranscription only responds (resolving
+	// connect() and moving status to 'connected') after audio has flowed, so this
+	// backend must receive audio during the 'pending' window. sendAudio() buffers
+	// into audioSource; the streaming request body drains that buffer, which is
+	// what makes the service respond. See feat/aws-transcribe-deadlock-fix.
+	readonly acceptsAudioBeforeConnected = true;
+
 	private status: BackendStatus = 'pending';
 	private client: TranscribeStreamingClient | undefined;
 	private audioSource: AudioStreamSource | undefined;
@@ -119,7 +126,21 @@ export class AWSTranscribeBackend implements TranscriptionBackend {
 	}
 
 	async sendAudio(audioBase64: string): Promise<void> {
-		if (this.status !== 'connected' || !this.audioSource) return;
+		// Feed audio the moment the source exists — do NOT gate on
+		// status === 'connected'. connect() sets status to 'connected' only AFTER
+		// `await client.send(...)` resolves, and with a streaming AudioStream input
+		// send() does not resolve until Amazon Transcribe returns response headers,
+		// which the service withholds until it has received audio. Gating sendAudio
+		// on 'connected' therefore deadlocks: audio arriving during the 'pending'
+		// window is dropped, so the AudioStream generator starves, so the service
+		// never responds, so send() never resolves, so status never becomes
+		// 'connected' — Transcribe kills the stream after 15s with no audio
+		// (interims=0, finals=0, reconnect loop). The generator is already being
+		// consumed by the SDK's request-body pipe during send(), so pushing into
+		// audioSource here is what MAKES send() resolve. audioSource is created
+		// synchronously at the top of connect(); once close() clears it, or before
+		// connect() runs, there is nothing to feed. See feat/aws-transcribe-deadlock-fix.
+		if (this.status === 'closed' || !this.audioSource) return;
 		const pcm = Buffer.from(audioBase64, 'base64');
 		this.audioSource.push(pcm);
 		this.recordThroughput(pcm.length);

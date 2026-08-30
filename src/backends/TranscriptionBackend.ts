@@ -95,6 +95,22 @@ export interface TranscriptionBackend {
 	 */
 	getStatus(): 'pending' | 'connected' | 'failed' | 'closed';
 
+	/**
+	 * When true, the backend accepts sendAudio() calls before getStatus() reaches
+	 * 'connected'; it buffers pre-connected audio internally. This is REQUIRED for
+	 * backends whose connect() only resolves after the service has received audio
+	 * (Amazon Transcribe Streaming: StartStreamTranscription does not return a
+	 * response — and so does not transition the backend to 'connected' — until
+	 * audio has flowed). OutgoingConnection hands audio to such a backend during
+	 * the 'pending' window instead of queuing it, which would otherwise deadlock:
+	 * no audio -> no response -> never 'connected' -> queued audio never flushed.
+	 *
+	 * WebSocket backends leave this undefined/false: their sendAudio() throws
+	 * before the socket is open, so their pre-connected audio must stay queued in
+	 * OutgoingConnection.pendingAudioFrames and flush once 'connected'.
+	 */
+	acceptsAudioBeforeConnected?: boolean;
+
 	// Event callbacks - set by OutgoingConnection
 	onInterimTranscription?: (message: TranscriptionMessage) => void;
 	onCompleteTranscription?: (message: TranscriptionMessage) => void;

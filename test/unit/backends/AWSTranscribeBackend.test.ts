@@ -26,6 +26,16 @@ interface MockController {
 	captureAudioStream: boolean;
 	/** The AudioStream async iterable handed to the SDK, captured for manual draining. */
 	capturedAudioStream: AsyncIterable<any> | undefined;
+	/**
+	 * When true, send() mimics real Amazon Transcribe: its returned promise does
+	 * NOT resolve until the AudioStream generator has yielded its first chunk (the
+	 * service withholds its response until audio arrives). This surfaces the
+	 * connect()/sendAudio() deadlock that captureAudioStream=false (eager resolve)
+	 * hides. Requires audio to be pushed while connect() is still in flight.
+	 */
+	sendResolvesOnFirstAudio: boolean;
+	/** Chunks the mock has drained from the AudioStream, base64-encoded, in order. */
+	drainedChunks: string[];
 }
 
 const controller: MockController = {
@@ -34,6 +44,8 @@ const controller: MockController = {
 	sendError: undefined,
 	captureAudioStream: false,
 	capturedAudioStream: undefined,
+	sendResolvesOnFirstAudio: false,
+	drainedChunks: [],
 };
 
 vi.mock('@aws-sdk/client-transcribe-streaming', () => {
@@ -48,7 +60,35 @@ vi.mock('@aws-sdk/client-transcribe-streaming', () => {
 		async send(command: any) {
 			if (controller.sendError) throw controller.sendError;
 			controller.capturedAudioStream = command.input.AudioStream;
-			if (!controller.captureAudioStream) {
+
+			if (controller.sendResolvesOnFirstAudio) {
+				// Real-service model: consume the AudioStream here and do not resolve
+				// until the FIRST chunk arrives. If sendAudio() is gated on status
+				// === 'connected' (which is set only after this resolves), no chunk
+				// ever arrives and this await hangs — reproducing the production
+				// 15s no-audio deadlock as an unresolved connect() in the test.
+				const iterator = command.input.AudioStream[Symbol.asyncIterator]();
+				const first = await iterator.next(); // wait for the first pushed AudioEvent
+				if (!first.done && first.value?.AudioEvent?.AudioChunk) {
+					controller.drainedChunks.push(Buffer.from(first.value.AudioEvent.AudioChunk).toString('base64'));
+				}
+				// Continue draining the rest in the background so later pushes don't
+				// block; record each chunk so tests can assert order without creating
+				// a second competing iterator over the same generator.
+				void (async () => {
+					try {
+						let next = await iterator.next();
+						while (!next.done) {
+							if (next.value?.AudioEvent?.AudioChunk) {
+								controller.drainedChunks.push(Buffer.from(next.value.AudioEvent.AudioChunk).toString('base64'));
+							}
+							next = await iterator.next();
+						}
+					} catch {
+						// ignore
+					}
+				})();
+			} else if (!controller.captureAudioStream) {
 				// Drain the AudioStream generator lazily in the background so the
 				// backend's push()/end() calls don't block; we don't assert on it here.
 				void (async () => {
@@ -120,6 +160,8 @@ describe('AWSTranscribeBackend', () => {
 		controller.sendError = undefined;
 		controller.captureAudioStream = false;
 		controller.capturedAudioStream = undefined;
+		controller.sendResolvesOnFirstAudio = false;
+		controller.drainedChunks = [];
 		// Ensure a deterministic config: default auto-detect, 16000.
 		delete process.env.AWS_TRANSCRIBE_LANGUAGE;
 		delete process.env.AWS_TRANSCRIBE_LANGUAGE_OPTIONS;
@@ -366,6 +408,80 @@ describe('AWSTranscribeBackend', () => {
 		const { value } = await iter.next();
 		expect(value.AudioEvent.AudioChunk.byteLength).toBeGreaterThan(0);
 		expect(Buffer.from(value.AudioEvent.AudioChunk).toString('base64')).toBe(b64);
+		backend.close();
+	});
+
+	// --- Deadlock regression (feat/aws-transcribe-deadlock-fix) ---------------
+	// Amazon Transcribe's StartStreamTranscription does not respond — so
+	// client.send() does not resolve, so status never becomes 'connected' — until
+	// audio has flowed. The previous sendAudio() gated on status === 'connected',
+	// dropping every frame that arrived during the 'pending' window, so the
+	// AudioStream generator starved, send() never resolved, and the service killed
+	// the stream after 15s (interims=0, finals=0, reconnect loop). These tests
+	// pin the fix: audio pushed while connect() is still in flight must reach the
+	// AudioStream and thereby let connect() resolve.
+
+	it('does NOT gate sendAudio on connected: audio pushed while connect() is in flight reaches the stream and resolves connect()', async () => {
+		// send() resolves only after the first AudioEvent — exactly like the real
+		// service. A status-gated sendAudio would drop the pre-connected frame and
+		// this connect() would hang forever.
+		controller.sendResolvesOnFirstAudio = true;
+
+		const backend = new AWSTranscribeBackend('p1', participant);
+
+		// Kick off connect() but do NOT await it yet — it cannot resolve until we
+		// feed audio, which is the whole point.
+		const connectPromise = backend.connect({});
+
+		// Let connect() run up to `await client.send(...)`. Status is still 'pending'.
+		await new Promise((r) => setTimeout(r, 10));
+		expect(backend.getStatus()).toBe('pending');
+
+		// Push a frame during the pending window. The fixed sendAudio() must accept
+		// it (buffer into audioSource) rather than dropping it on the status gate.
+		await backend.sendAudio(pcmBase64(320, 5));
+
+		// With the frame delivered, the mock's send() resolves, connect() completes,
+		// and status transitions to 'connected'. A 500ms race guards against the
+		// regression (unresolved connect() == the production hang).
+		const settled = await Promise.race([
+			connectPromise.then(() => 'resolved' as const),
+			new Promise<'timeout'>((r) => setTimeout(() => r('timeout'), 500)),
+		]);
+		expect(settled).toBe('resolved');
+		expect(backend.getStatus()).toBe('connected');
+		backend.close();
+	});
+
+	it('declares acceptsAudioBeforeConnected so OutgoingConnection feeds audio during the pending window', () => {
+		// The capability flag is what tells OutgoingConnection to hand audio over
+		// while the backend is 'pending' instead of queuing it (the queue would
+		// only flush after connect() resolves, which for this backend never happens
+		// without audio — the deadlock). WebSocket backends must NOT set this.
+		const backend = new AWSTranscribeBackend('p1', participant);
+		expect(backend.acceptsAudioBeforeConnected).toBe(true);
+	});
+
+	it('buffers pre-connected frames so none are lost before status reaches connected', async () => {
+		controller.sendResolvesOnFirstAudio = true;
+		const backend = new AWSTranscribeBackend('p1', participant);
+
+		const connectPromise = backend.connect({});
+		await new Promise((r) => setTimeout(r, 10));
+		expect(backend.getStatus()).toBe('pending');
+
+		// Push several frames while still pending. The first unblocks send(); all
+		// must be preserved in order in the AudioStream (none dropped by a gate).
+		const frames = [pcmBase64(320, 1), pcmBase64(320, 2), pcmBase64(320, 3)];
+		for (const f of frames) await backend.sendAudio(f);
+
+		await connectPromise;
+		expect(backend.getStatus()).toBe('connected');
+
+		// The mock records every chunk it drains from the AudioStream. Let its
+		// background drain catch up, then confirm every pushed frame arrived in order.
+		await flush();
+		expect(controller.drainedChunks).toEqual(frames);
 		backend.close();
 	});
 });
