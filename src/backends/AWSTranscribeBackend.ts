@@ -5,11 +5,13 @@
  * the default AWS credential chain (ECS task role, instance profile, or env
  * credentials) — no API key is embedded or required.
  *
- * Audio: Transcribe Streaming wants PCM signed 16-bit little-endian. This backend
- * requests l16 at config.awsTranscribe.sampleRate (default 16000) via
- * getDesiredAudioFormat(); the proxy's decoder produces PCM already at that rate,
- * so no in-backend resample is needed (opus -> OpusAudioDecoder(16000);
- * l16 -> L16Decoder resamples 24000->16000; ogg -> Cascaded).
+ * Audio: Transcribe Streaming wants PCM signed 16-bit little-endian, mono. This
+ * backend requests l16 at config.awsTranscribe.sampleRate (default 16000) via
+ * getDesiredAudioFormat(); the proxy's OpusAudioDecoder is constructed with
+ * { sampleRate, channels: 1 }, so libopus resamples to that rate AND downmixes
+ * to mono before the bytes reach sendAudio() — the forwarded PCM already matches
+ * MediaSampleRateHertz as mono 16-bit LE, so no in-backend resample/downmix is
+ * needed (this mirrors DeepgramBackend, which drives the same decoder at mono).
  *
  * Language: default is IdentifyMultipleLanguages across config.awsTranscribe
  * .languageOptions ('en-US,es-US') for a bilingual room. A per-connection
@@ -118,13 +120,45 @@ export class AWSTranscribeBackend implements TranscriptionBackend {
 
 	async sendAudio(audioBase64: string): Promise<void> {
 		if (this.status !== 'connected' || !this.audioSource) return;
-		this.audioSource.push(Buffer.from(audioBase64, 'base64'));
+		const pcm = Buffer.from(audioBase64, 'base64');
+		this.audioSource.push(pcm);
+		this.recordThroughput(pcm.length);
+	}
+
+	// --- Gated throughput instrumentation --------------------------------
+	// Confirms, on a live run, that non-empty PCM is actually reaching the
+	// Transcribe AudioStream at the sample rate the stream was opened with.
+	// interims=0/finals=0 with zero bytes/sec here => audio never left the
+	// backend (generator stall); non-zero bytes/sec that mismatch the expected
+	// rate => a format problem. LOG_LEVEL=debug only; no allocation otherwise.
+	private throughputBytes = 0;
+	private throughputWindowStart = 0;
+
+	private recordThroughput(byteLen: number): void {
+		if (!logger.isLevelEnabled('debug')) return;
+		const now = Date.now();
+		if (this.throughputWindowStart === 0) this.throughputWindowStart = now;
+		this.throughputBytes += byteLen;
+		const elapsedMs = now - this.throughputWindowStart;
+		if (elapsedMs < 1000) return;
+		const rate = config.awsTranscribe.sampleRate;
+		// mono 16-bit LE => 2 bytes/sample => expected bytes/sec = rate * 2
+		const bytesPerSec = Math.round((this.throughputBytes * 1000) / elapsedMs);
+		const expectedBps = rate * 2;
+		logger.debug(
+			`[${this.tag}] Transcribe audio throughput: ${bytesPerSec} bytes/sec ` +
+				`(expected ~${expectedBps} for mono 16-bit @ ${rate}Hz), ` +
+				`window=${elapsedMs}ms bytes=${this.throughputBytes}`,
+		);
+		this.throughputBytes = 0;
+		this.throughputWindowStart = now;
 	}
 
 	forceCommit(): void {
 		// Transcribe Streaming finalizes on detected silence automatically; there is
-		// no explicit flush verb. Best-effort: push a zero-length chunk to nudge the
-		// service to emit any pending partial as it processes the input boundary.
+		// no explicit flush verb. Best-effort: fire the audio source's signal so a
+		// parked stream generator re-checks its queue. The zero-length buffer itself
+		// is dropped by AudioStreamSource.push() (Transcribe rejects empty chunks).
 		if (this.status !== 'connected' || !this.audioSource) return;
 		this.audioSource.push(Buffer.alloc(0));
 	}
@@ -248,34 +282,65 @@ function averageItemConfidence(alternative: { Items?: Array<{ Confidence?: numbe
 
 /**
  * Bridges imperative push()/end() calls into the AsyncIterable<AudioStream> the
- * SDK's StartStreamTranscriptionCommand expects. Backpressure is unbounded (the
- * proxy already paces audio at real time), so the queue stays small.
+ * SDK's StartStreamTranscriptionCommand expects.
+ *
+ * The generator must never lose a wakeup: the previous check-then-await version
+ * evaluated `queue.length === 0` and only then created the wake promise, so a
+ * push() landing in that gap (when `wake` was still undefined) queued a chunk
+ * without arming any waiter — the generator then awaited a promise that only
+ * resolved on the *next* push, parking the stream. With one participant pushing
+ * ~20ms Opus frames that gap opens routinely; a single miss stalls the stream
+ * and Amazon Transcribe kills it after 15s with no audio received (interims=0,
+ * finals=0, reconnect loop). See feat/aws-transcribe-audio-fix.
+ *
+ * Fix: a single reusable "signal" promise that push()/end() always resolve, and
+ * that the generator recreates only while holding the knowledge that the queue
+ * is empty. The generator re-checks the queue after every wait, so a chunk that
+ * arrives concurrently with (or just before) the wait is always drained rather
+ * than stranded.
  */
 class AudioStreamSource {
 	private queue: Buffer[] = [];
-	private wake: (() => void) | undefined;
 	private done = false;
+	/** Resolves whenever new data is pushed or the stream is ended. */
+	private signal: Promise<void>;
+	private resolveSignal!: () => void;
+
+	constructor() {
+		this.signal = new Promise<void>((resolve) => {
+			this.resolveSignal = resolve;
+		});
+	}
+
+	/** Wake any current waiter and arm a fresh signal for the next wait. */
+	private fire(): void {
+		const resolve = this.resolveSignal;
+		this.signal = new Promise<void>((r) => {
+			this.resolveSignal = r;
+		});
+		resolve();
+	}
 
 	push(chunk: Buffer): void {
 		if (this.done) return;
-		this.queue.push(chunk);
-		this.wake?.();
-		this.wake = undefined;
+		// Drop zero-length chunks here: they carry no audio and forceCommit()'s
+		// best-effort nudge must not enqueue empty AudioEvents (Transcribe rejects
+		// a zero-length AudioChunk). We still fire the signal so a parked generator
+		// re-checks the queue.
+		if (chunk.length > 0) {
+			this.queue.push(chunk);
+		}
+		this.fire();
 	}
 
 	end(): void {
 		this.done = true;
-		this.wake?.();
-		this.wake = undefined;
+		this.fire();
 	}
 
 	async *stream(): AsyncGenerator<AudioStream> {
 		while (true) {
-			if (this.queue.length === 0 && !this.done) {
-				await new Promise<void>((resolve) => {
-					this.wake = resolve;
-				});
-			}
+			// Drain everything currently queued before waiting again.
 			while (this.queue.length > 0) {
 				const chunk = this.queue.shift();
 				if (chunk && chunk.length > 0) {
@@ -283,6 +348,11 @@ class AudioStreamSource {
 				}
 			}
 			if (this.done) return;
+			// Queue is empty and not done: wait for the next push()/end(). Capture
+			// the signal reference BEFORE awaiting so a push() that fires between
+			// the drain above and this await still resolves the promise we await —
+			// no wakeup can be lost.
+			await this.signal;
 		}
 	}
 }
